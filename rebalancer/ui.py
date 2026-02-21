@@ -514,82 +514,73 @@ def on_apply(event):
 # =============================================================================
 
 def _render_results(result: pd.DataFrame) -> str:
-    """Build the full HTML output with improved contrast and alignment."""
+    """Build the full HTML output for the rebalance results section."""
     total_invested = result["buy_cost"].sum()
     current_val = result["current_value"].sum()
     liq_val = result["sell_value"].sum()
     available = monthly_input.value + liq_val
     leftover = available - total_invested
     n_sells = int((result["sell_qty"] > 0).sum())
+    n_buys = int((result["buy_qty"] > 0).sum())
     n_restricted = int((result["category"] == "RESTRICTED").sum())
     restricted_val = result.loc[result["category"] == "RESTRICTED", "current_value"].sum()
 
     # ── Summary cards ──
-    def _card(label, val, color, border_color=None, bg="#1a2332", subtitle=None):
-        border = f"border: 1px solid {border_color};" if border_color else ""
-        sub_html = f'<div style="font-size:11px;color:{border_color or "#888"};margin-top:2px;">{subtitle}</div>' if subtitle else ""
+    def _card(label, val, color, border_color="#374151", bg="#111827", extra_content=""):
         return (
-            f'<div style="background:{bg};padding:12px 18px;border-radius:8px;min-width:145px;{border}flex:1;">'
-            f'<div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.5px;">{label}</div>'
-            f'<div style="font-size:20px;font-weight:700;color:{color};">₹{val:,.0f}</div>{sub_html}</div>'
+            f'<div style="background:{bg};padding:12px 16px;border-radius:8px;min-width:145px;'
+            f'border:1px solid {border_color};flex:1;box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3);">'
+            f'<div style="font-size:10px;color:#9ca3af;text-transform:uppercase;font-weight:600;">{label}</div>'
+            f'<div style="font-size:18px;font-weight:700;color:{color};margin-top:4px;">{val}</div>'
+            f'{extra_content}</div>'
         )
 
-    cards = [
-        _card("Portfolio Value", current_val, "#60a5fa"),
-        _card("Fresh SIP", monthly_input.value, "#34d399")
-    ]
-    if liq_val > 0:
-        cards.append(_card(f"Liquidation ({n_sells})", liq_val, "#f87171", "#7f1d1d", "#2a1a1a"))
-    if n_restricted > 0:
-        cards.append(_card(f"Restricted ({n_restricted})", restricted_val, "#fbbf24", "#92400e", "#2a2a1a", "frozen"))
+    order_card_breakup = (
+        f'<div style="display:flex;gap:8px;margin-top:4px;font-size:10px;font-weight:600;">'
+        f'<span style="color:#34d399;">● {n_buys} BUYS</span>'
+        f'<span style="color:#f87171;">● {n_sells} SELLS</span></div>'
+    )
+
+    summary = (
+        f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;">'
+        + _card("Portfolio Value", f"₹{current_val:,.0f}", "#60a5fa")
+        + _card("Invested Amount", f"₹{monthly_input.value:,.0f}", "#34d399")
+        + _card("Total Orders", f"{n_buys + n_sells} Orders", "#fff", "#4b5563", "#1f2937", order_card_breakup)
+        + (_card("Restricted", f"₹{restricted_val:,.0f}", "#fbbf24", "#78350f", "#1a1610") if n_restricted > 0 else "")
+        + _card("Total Cash", f"₹{available:,.0f}", "#a78bfa")
+        + _card("Deployed", f"₹{total_invested:,.0f}", "#fcd34d")
+        + _card("Uninvested", f"₹{leftover:,.0f}", "#f87171" if leftover < 0 else "#94a3b8")
+        + "</div>"
+    )
+
+    # ── Table Headers ──
+    hdrs = [("Ticker", 0), ("Name", 0), ("Price", 1), ("Target", 1), ("Current", 1), 
+            ("Drift", 1), ("Action", 0), ("Cash Flow", 1), ("New Held", 1), ("New Wt", 1)]
     
-    cards.extend([
-        _card("Total Cash", available, "#a78bfa"),
-        _card("Deployed", total_invested, "#fbbf24"),
-        _card("Uninvested", leftover, "#f87171" if leftover < 0 else "#94a3b8")
-    ])
-
-    summary = f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;">{" ".join(cards)}</div>'
-
-    # ── Table Header Definition ──
-    # Align: 0=left, 1=right
-    hdrs = [
-        ("Ticker", 0), ("Name", 0), ("Price", 1), ("Target", 1), 
-        ("Current", 1), ("Drift", 1), ("Action", 0), 
-        ("Cash Flow", 1), ("New Held", 1), ("New Wt", 1)
-    ]
-
     header_html = "".join([
-        f'<th style="padding:12px 10px;text-align:{"right" if a else "left"};color:#9ca3af;'
-        f'font-size:11px;text-transform:uppercase;border-bottom:2px solid #1f2937;">{h}</th>' 
+        f'<th style="padding:12px 8px;text-align:{"right" if a else "left"};color:#6b7280;'
+        f'font-size:11px;text-transform:uppercase;border-bottom:1px solid #374151;">{h}</th>' 
         for h, a in hdrs
     ])
 
-    # ── Orders rows ──
     rows = ""
     for _, r in result.iterrows():
-        cat = r["category"]
         is_sell = int(r["sell_qty"]) > 0
         is_buy = int(r["buy_qty"]) > 0
-
-        # Row Styling
-        row_bg = "transparent"
-        if cat == "RESTRICTED": 
-            row_bg = "rgba(251, 191, 36, 0.05)"
-        elif is_sell: 
-            row_bg = "rgba(248, 113, 113, 0.05)"
-        elif is_buy: 
-            row_bg = "rgba(52, 211, 153, 0.05)"
-
-        # Action Formatting
+        cat = r["category"]
+        
+        row_style = ("transparent", "transparent")
         if cat == "RESTRICTED":
-            act = '<span style="color:#fbbf24;font-weight:600;font-size:11px;border:1px solid #92400e;padding:2px 6px;border-radius:4px;">🔒 RESTRICTED</span>'
-            cf = '<span style="color:#92400e;font-style:italic;">frozen</span>'
+            row_style = ("rgba(251, 191, 36, 0.08)", "#f59e0b")
+            act = '<span style="background:#451a03;color:#fbbf24;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;border:1px solid #78350f;display:inline-block;width:95px;text-align:center;">🔒 FROZEN</span>'
+            cf = '<span style="color:#92400e;">—</span>'
         elif is_sell:
-            act = f'<span style="background:#451a1a;color:#f87171;padding:4px 8px;border-radius:4px;font-weight:700;font-size:11px;">🔴 SELL {int(r["sell_qty"])}</span>'
+            row_style = ("rgba(248, 113, 113, 0.08)", "#ef4444")
+            act = f'<span style="background:#450a0a;color:#f87171;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;border:1px solid #7f1d1d;display:inline-block;width:95px;text-align:center;">🔴 SELL {int(r["sell_qty"])}</span>'
             cf = f'<span style="color:#f87171;font-weight:600;">+₹{r["sell_value"]:,.0f}</span>'
         elif is_buy:
-            act = f'<span style="background:#143a2a;color:#34d399;padding:4px 8px;border-radius:4px;font-weight:700;font-size:11px;">🟢 BUY {int(r["buy_qty"])}</span>'
+            row_style = ("rgba(16, 185, 129, 0.08)", "#10b981")
+            act = f'<span style="background:#064e3b;color:#34d399;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;border:1px solid #065f46;display:inline-block;width:95px;text-align:center;">🟢 BUY {int(r["buy_qty"])}</span>'
             cf = f'<span style="color:#60a5fa;font-weight:600;">−₹{r["buy_cost"]:,.0f}</span>'
         else:
             act = '<span style="color:#4b5563;">—</span>'
@@ -597,32 +588,29 @@ def _render_results(result: pd.DataFrame) -> str:
 
         dv = r["drift"]
         dc = "#f87171" if dv < -1 else "#34d399" if dv > 1 else "#9ca3af"
-        nc = "#34d399" if abs(r["new_weight"] - r["weight"]) < 2 else "#fbbf24"
 
         rows += (
-            f'<tr style="background:{row_bg};border-bottom:1px solid #1f2937;">'
-            f'<td style="padding:10px;font-weight:700;color:#fff;">{r["ticker"]}</td>'
-            f'<td style="padding:10px;color:#d1d5db;min-width:180px;">{r["name"]}</td>'
-            f'<td style="padding:10px;text-align:right;color:#e5e7eb;">₹{r["price"]:,.2f}</td>'
-            f'<td style="padding:10px;text-align:right;color:#fbbf24;font-weight:600;">{r["weight"]:.1f}%</td>'
-            f'<td style="padding:10px;text-align:right;color:#9ca3af;">{r["current_weight"]:.1f}%</td>'
-            f'<td style="padding:10px;text-align:right;color:{dc};font-weight:600;">{"+" if dv > 2 else "+" if dv > 0 else ""}{dv:.1f}%</td>'
-            f'<td style="padding:10px;">{act}</td>'
-            f'<td style="padding:10px;text-align:right;">{cf}</td>'
-            f'<td style="padding:10px;text-align:right;color:#e5e7eb;">{int(r["new_held"])}</td>'
-            f'<td style="padding:10px;text-align:right;color:{nc};font-weight:700;">{r["new_weight"]:.1f}%</td>'
+            f'<tr style="background:{row_style[0]};border-bottom:1px solid #1f2937;">'
+            f'<td style="padding:12px 8px;font-weight:700;color:#fff;border-left:4px solid {row_style[1]};">{r["ticker"]}</td>'
+            f'<td style="padding:12px 8px;color:#e5e7eb;font-size:12px;">{r["name"]}</td>'
+            f'<td style="padding:12px 8px;text-align:right;color:#d1d5db;">₹{r["price"]:,.2f}</td>'
+            f'<td style="padding:12px 8px;text-align:right;color:#fbbf24;font-weight:600;">{r["weight"]:.1f}%</td>'
+            f'<td style="padding:12px 8px;text-align:right;color:#9ca3af;">{r["current_weight"]:.1f}%</td>'
+            f'<td style="padding:12px 8px;text-align:right;color:{dc};font-weight:600;">{"+" if dv > 0 else ""}{dv:.1f}%</td>'
+            f'<td style="padding:12px 8px;">{act}</td>'
+            f'<td style="padding:12px 8px;text-align:right;">{cf}</td>'
+            f'<td style="padding:12px 8px;text-align:right;color:#fff;">{int(r["new_held"])}</td>'
+            f'<td style="padding:12px 8px;text-align:right;color:#fff;font-weight:700;">{r["new_weight"]:.1f}%</td>'
             f"</tr>"
         )
 
     table = (
-        '<table style="width:100%;border-collapse:collapse;font-size:13px;'
-        'background:#111827;border-radius:12px;overflow:hidden;font-family:sans-serif;">'
-        f'<thead><tr style="background:#0f172a;">{header_html}</tr></thead>'
+        '<table style="width:100%;border-collapse:collapse;font-size:13px;background:#0b0f1a;font-family:ui-sans-serif,system-ui,sans-serif;">'
+        f'<thead><tr style="background:#020617;">{header_html}</tr></thead>'
         f'<tbody>{rows}</tbody></table>'
     )
     
-    return summary + table
-
+    return f'<div style="background:#0b0f1a;padding:10px;border-radius:12px;">{summary}{table}</div>'
 
 # =============================================================================
 # Wire Up Callbacks
