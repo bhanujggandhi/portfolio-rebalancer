@@ -2,7 +2,7 @@
 Portfolio Rebalancer — Panel + yFinance
 ========================================
 Multi-portfolio SIP-style rebalancer with live NSE prices, liquidation
-support, state history browsing, and portfolio management.
+support, trade restrictions, state history, and portfolio management.
 
 Setup:
     pip install panel yfinance pandas
@@ -99,68 +99,111 @@ def _fetch_price_single(ticker_symbol: str) -> float | None:
     return None
 
 # =============================================================================
-# 3. REBALANCING LOGIC (with liquidation support)
+# 3. REBALANCING LOGIC
 #
-#    Active stocks (weight > 0): buy-only, deficit-proportional allocation.
-#    Liquidation stocks (weight == 0, held > 0): full sell, proceeds recycled.
-#    Cash pool = new_monthly_sip + sum(liquidation_proceeds)
+#    Every stock falls into exactly one of four categories:
+#
+#      RESTRICTED   — restricted=True (any weight) → completely frozen
+#      LIQUIDATION  — restricted=False, weight=0, held>0 → sell all
+#      ACTIVE       — restricted=False, weight>0 → buy to close deficit
+#      INERT        — restricted=False, weight=0, held=0 → no action
+#
+#    Cash pool = new_monthly_sip + sum(unrestricted liquidation proceeds)
+#
+#    Restricted stocks are frozen but their current value IS included in
+#    total portfolio valuation so that active stocks' targets remain accurate.
+#    This way, when the restriction lifts next month, the deficit algorithm
+#    naturally corrects any drift that accumulated while it was restricted.
 # =============================================================================
 
 
 def calculate_rebalance(
-    portfolio: pd.DataFrame,
+    portfolio: pd.DataFrame,   # columns: ticker, name, weight, held, price, restricted
     new_cash: float,
 ) -> pd.DataFrame:
-    """Compute buy/sell orders to push portfolio toward target weights."""
+    """
+    Compute buy/sell orders to push portfolio toward target weights,
+    respecting trade restrictions on individual tickers.
+    """
     df = portfolio.copy()
     df["current_value"] = df["held"] * df["price"]
 
-    # ── Liquidations: weight=0 with shares held → sell everything ──
-    is_liq = (df["weight"] == 0) & (df["held"] > 0)
+    # ── Ensure restricted column exists (backward compat with old data) ──
+    if "restricted" not in df.columns:
+        df["restricted"] = False
+    df["restricted"] = df["restricted"].fillna(False).astype(bool)
+
+    # ── Classify each stock ──
+    def _classify(row):
+        if row["restricted"]:
+            return "RESTRICTED"
+        if row["weight"] == 0 and row["held"] > 0:
+            return "LIQUIDATION"
+        if row["weight"] > 0:
+            return "ACTIVE"
+        return "INERT"
+
+    df["category"] = df.apply(_classify, axis=1)
+
+    # ── Initialize order columns ──
     df["sell_qty"] = 0
+    df["sell_value"] = 0.0
+    df["buy_qty"] = 0
+    df["buy_cost"] = 0.0
+
+    # ── LIQUIDATION: sell everything for unrestricted zero-weight stocks ──
+    is_liq = df["category"] == "LIQUIDATION"
     df.loc[is_liq, "sell_qty"] = df.loc[is_liq, "held"]
-    df["sell_value"] = df["sell_qty"] * df["price"]
+    df.loc[is_liq, "sell_value"] = df.loc[is_liq,
+                                          "sell_qty"] * df.loc[is_liq, "price"]
     liq_proceeds = df["sell_value"].sum()
 
     # ── Available cash = fresh SIP + liquidation proceeds ──
     available_cash = new_cash + liq_proceeds
 
-    # ── Rebalance active stocks only ──
-    active = df["weight"] > 0
-    active_val = df.loc[active, "current_value"].sum()
-    total_target = active_val + available_cash
+    # ── ACTIVE stocks: deficit-proportional allocation ──
+    # Total target includes restricted stocks' frozen value so that active
+    # stocks' targets are computed in the context of the full portfolio.
+    is_active = df["category"] == "ACTIVE"
+    is_restricted = df["category"] == "RESTRICTED"
+
+    restricted_value = df.loc[is_restricted, "current_value"].sum()
+    active_value = df.loc[is_active, "current_value"].sum()
+    total_target = restricted_value + active_value + available_cash
 
     df["target_value"] = 0.0
-    df.loc[active, "target_value"] = total_target * \
-        (df.loc[active, "weight"] / 100.0)
+    df.loc[is_active, "target_value"] = total_target * \
+        (df.loc[is_active, "weight"] / 100.0)
 
     df["deficit"] = 0.0
-    df.loc[active, "deficit"] = (
-        df.loc[active, "target_value"] - df.loc[active, "current_value"]
+    df.loc[is_active, "deficit"] = (
+        df.loc[is_active, "target_value"] - df.loc[is_active, "current_value"]
     ).clip(lower=0)
-    total_deficit = df.loc[active, "deficit"].sum()
+    total_deficit = df.loc[is_active, "deficit"].sum()
 
     df["allocation"] = 0.0
     if total_deficit > 0:
-        df.loc[active, "allocation"] = (
-            df.loc[active, "deficit"] / total_deficit
+        df.loc[is_active, "allocation"] = (
+            df.loc[is_active, "deficit"] / total_deficit
         ) * available_cash
     else:
-        ws = df.loc[active, "weight"].sum()
+        ws = df.loc[is_active, "weight"].sum()
         if ws > 0:
-            df.loc[active, "allocation"] = available_cash * \
-                (df.loc[active, "weight"] / ws)
+            df.loc[is_active, "allocation"] = available_cash * \
+                (df.loc[is_active, "weight"] / ws)
 
-    df["buy_qty"] = 0
-    ok = active & (df["price"] > 0)
+    # ── Convert allocations to whole-share buy orders ──
+    ok = is_active & (df["price"] > 0)
     df.loc[ok, "buy_qty"] = (
         df.loc[ok, "allocation"] / df.loc[ok, "price"]
     ).apply(math.floor).astype(int)
     df["buy_cost"] = df["buy_qty"] * df["price"]
 
+    # ── Post-rebalance state ──
     df["new_held"] = df["held"] + df["buy_qty"] - df["sell_qty"]
     df["new_value"] = df["new_held"] * df["price"]
 
+    # ── Weight analysis ──
     tc = df["current_value"].sum()
     nt = df["new_value"].sum()
     df["current_weight"] = (df["current_value"] / tc *
@@ -175,22 +218,18 @@ def calculate_rebalance(
 #
 #    Directory structure:
 #      state/
-#        portfolios.json              ← registry of all portfolios
+#        portfolios.json                ← registry of all portfolios
 #        {portfolio_slug}/
-#          rebalance_2025-01-15_...json
-#          rebalance_2025-02-15_...json
+#          rebalance_YYYY-MM-DD_HHMMSS.json
 #
-#    portfolios.json format:
-#      {
-#        "portfolios": [
-#          {"slug": "growth", "name": "Growth Portfolio", "created": "..."},
-#          {"slug": "conservative", "name": "Conservative", "created": "..."}
-#        ]
-#      }
+#    Backward compatibility:
+#      - Old state files without "restricted_tickers" → treated as []
+#      - Old portfolio rows without "restricted" → treated as False
+#      - Old state files without "applied" → treated as False
+#      - Missing "ticker_names" → falls back to _name_cache or raw symbol
 #
-#    Each rebalance JSON has an "applied" flag. On startup we only restore
-#    from applied states. The state dropdown lets you load any state (applied
-#    or not) for review or rollback.
+#    Restrictions are saved for audit but NOT restored on load (they reset
+#    each session because they're inherently a per-month decision).
 # =============================================================================
 
 
@@ -198,7 +237,6 @@ STATE_DIR = Path(__file__).resolve().parent / "state"
 MAX_STATE_FILES = 50
 DEFAULT_PORTFOLIO_NAME = "Default Portfolio"
 
-# The default set of stocks used when creating a brand-new portfolio.
 DEFAULT_STOCKS = [
     {"ticker": "IDFCFIRSTB.NS", "weight": 20.0, "held": 0, "price": 0.0},
     {"ticker": "FIVESTAR.NS",   "weight": 15.0, "held": 0, "price": 0.0},
@@ -212,31 +250,46 @@ DEFAULT_STOCKS = [
 
 
 def _slugify(name: str) -> str:
-    """
-    Convert a human-readable portfolio name into a filesystem-safe slug.
-    'My Growth Portfolio' → 'my-growth-portfolio'
-    """
     s = name.strip().lower()
-    s = re.sub(r"[^\w\s-]", "", s)      # remove special chars
-    s = re.sub(r"[\s_]+", "-", s)        # spaces/underscores → hyphens
-    s = re.sub(r"-+", "-", s).strip("-")  # collapse multiple hyphens
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
     return s or "unnamed"
 
 
 def _to_jsonable(v):
-    """Convert numpy/pandas types to JSON-safe Python types."""
     if hasattr(v, "item"):
         v = v.item()
     if isinstance(v, float):
         return None if v != v else round(v, 4)
     if isinstance(v, int) and not isinstance(v, bool):
         return int(v)
+    if isinstance(v, bool):
+        return bool(v)
     return v
 
 
-def _portfolio_with_names(rows: list[dict]) -> list[dict]:
-    """Ensure each row has a 'name' field derived from its ticker."""
-    return [{**r, "name": _name_cache.get(r["ticker"], r.get("name", ""))} for r in rows]
+def _ensure_portfolio_fields(rows: list[dict]) -> list[dict]:
+    """
+    Ensure every portfolio row has all required fields, with safe defaults
+    for anything missing. This is the backward-compatibility layer — old
+    state files may not have 'restricted' or even 'name' on every row.
+    """
+    out = []
+    for r in rows:
+        row = {**r}
+        row.setdefault("restricted", False)
+        row.setdefault("price", 0.0)
+        row.setdefault("held", 0)
+        row.setdefault("weight", 0.0)
+        # Resolve name: prefer cache, then existing value, then raw symbol
+        row["name"] = (
+            _name_cache.get(row["ticker"])
+            or row.get("name")
+            or row["ticker"].replace(".NS", "").replace(".BO", "")
+        )
+        out.append(row)
+    return out
 
 
 # ── Portfolio registry ──
@@ -246,11 +299,6 @@ def _registry_path() -> Path:
 
 
 def load_portfolio_registry() -> list[dict]:
-    """
-    Load the list of all portfolios from portfolios.json. Each entry has
-    'slug', 'name', and 'created' keys. If no registry exists, we create
-    one with a single default portfolio.
-    """
     path = _registry_path()
     if path.exists():
         try:
@@ -261,7 +309,6 @@ def load_portfolio_registry() -> list[dict]:
                 return portfolios
         except (json.JSONDecodeError, OSError):
             pass
-    # No registry yet — create one with the default portfolio
     default = [{
         "slug": _slugify(DEFAULT_PORTFOLIO_NAME),
         "name": DEFAULT_PORTFOLIO_NAME,
@@ -272,17 +319,12 @@ def load_portfolio_registry() -> list[dict]:
 
 
 def _save_portfolio_registry(portfolios: list[dict]):
-    """Write the portfolio registry to disk."""
     STATE_DIR.mkdir(exist_ok=True)
     with open(_registry_path(), "w", encoding="utf-8") as f:
         json.dump({"portfolios": portfolios}, f, indent=2)
 
 
 def add_portfolio_to_registry(name: str) -> dict | None:
-    """
-    Add a new portfolio to the registry. Returns the new entry dict,
-    or None if a portfolio with the same slug already exists.
-    """
     slug = _slugify(name)
     registry = load_portfolio_registry()
     if any(p["slug"] == slug for p in registry):
@@ -295,7 +337,6 @@ def add_portfolio_to_registry(name: str) -> dict | None:
 
 
 def delete_portfolio_from_registry(slug: str) -> bool:
-    """Remove a portfolio from the registry. Returns True if found and removed."""
     registry = load_portfolio_registry()
     before = len(registry)
     registry = [p for p in registry if p["slug"] != slug]
@@ -305,27 +346,16 @@ def delete_portfolio_from_registry(slug: str) -> bool:
     return False
 
 
-# ── Per-portfolio state directory ──
+# ── Per-portfolio state ──
 
 def _portfolio_state_dir(slug: str) -> Path:
-    """Return the state directory for a specific portfolio."""
     return STATE_DIR / slug
 
 
 def list_state_files(slug: str) -> list[dict]:
-    """
-    List all state files for a portfolio, most recent first. Each entry has:
-      - 'path': full Path object
-      - 'filename': just the filename
-      - 'timestamp': parsed datetime from filename
-      - 'applied': whether the state was confirmed
-      - 'summary': brief text for dropdown display
-      - 'label': formatted string for the dropdown widget
-    """
     d = _portfolio_state_dir(slug)
     if not d.exists():
         return []
-
     entries = []
     for fp in sorted(d.glob("rebalance_*.json"), reverse=True):
         try:
@@ -333,42 +363,35 @@ def list_state_files(slug: str) -> list[dict]:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
-
+        # .get() with defaults everywhere for backward compat with old schemas
         applied = data.get("applied", False)
         ts_str = data.get("timestamp", "")
         summary = data.get("summary", {})
         cur_val = summary.get("current_value", 0)
         amount = data.get("amount", 0)
-
-        # Parse timestamp for display
+        n_restricted = len(data.get("restricted_tickers", []))
         try:
             ts = datetime.fromisoformat(ts_str)
             ts_display = ts.strftime("%d %b %Y, %H:%M")
         except (ValueError, TypeError):
             ts_display = fp.stem
-
         status = "✅ Applied" if applied else "⏳ Calculated"
-        label = f"{ts_display} | {status} | Val: ₹{cur_val:,.0f} | SIP: ₹{amount:,.0f}"
-
+        restriction_note = f" | 🔒{n_restricted}" if n_restricted else ""
+        label = (
+            f"{ts_display} | {status} | Val: ₹{cur_val:,.0f}"
+            f" | SIP: ₹{amount:,.0f}{restriction_note}"
+        )
         entries.append({
-            "path": fp,
-            "filename": fp.name,
-            "timestamp": ts_str,
-            "applied": applied,
-            "label": label,
+            "path": fp, "filename": fp.name,
+            "timestamp": ts_str, "applied": applied, "label": label,
         })
-
     return entries
 
 
 def save_rebalance_state(
-    slug: str,
-    amount: float,
-    portfolio: list[dict],
-    result: pd.DataFrame,
-    applied: bool = False,
+    slug: str, amount: float, portfolio: list[dict],
+    result: pd.DataFrame, applied: bool = False,
 ) -> Path:
-    """Save rebalance data to a dated JSON file under the portfolio's directory."""
     d = _portfolio_state_dir(slug)
     d.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -378,17 +401,19 @@ def save_rebalance_state(
         {k: _to_jsonable(v) for k, v in row.to_dict().items()}
         for _, row in result.iterrows()
     ]
-
     liq_total = float(result["sell_value"].sum())
     ticker_names = {
         r["ticker"]: _name_cache.get(r["ticker"], r.get("name", ""))
         for r in portfolio
     }
+    restricted_tickers = [r["ticker"]
+                          for r in portfolio if r.get("restricted", False)]
 
     data = {
         "timestamp": datetime.now().isoformat(),
         "applied": applied,
         "amount": amount,
+        "restricted_tickers": restricted_tickers,
         "portfolio_before": portfolio,
         "rebalance_result": result_records,
         "summary": {
@@ -400,16 +425,13 @@ def save_rebalance_state(
         },
         "ticker_names": ticker_names,
     }
-
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
-
     _cleanup_old_state_files(slug)
     return filepath
 
 
 def mark_state_applied(filepath: Path):
-    """Flip the 'applied' flag to True in an existing state file."""
     try:
         with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
@@ -423,10 +445,10 @@ def mark_state_applied(filepath: Path):
 
 def load_state_from_file(filepath: Path) -> tuple[list[dict], float] | None:
     """
-    Load portfolio state from a specific state file. Works for both applied
-    and unapplied states. For applied states, 'new_held' is the post-trade
-    holding. For unapplied states, we load 'portfolio_before' (pre-trade)
-    so we don't show phantom trades the user never executed.
+    Load portfolio state from a specific state file.
+    Applied → use new_held (post-trade). Unapplied → use portfolio_before.
+    Restrictions are always reset to False on load (per-session decision).
+    All field reads use .get() for backward compat with old schemas.
     """
     try:
         with open(filepath, encoding="utf-8") as f:
@@ -436,7 +458,7 @@ def load_state_from_file(filepath: Path) -> tuple[list[dict], float] | None:
 
     applied = data.get("applied", False)
 
-    # Restore ticker name cache
+    # Restore ticker name cache from state file (if present)
     for ticker, name in data.get("ticker_names", {}).items():
         if name and ticker not in _name_cache:
             _name_cache[ticker] = name
@@ -444,46 +466,39 @@ def load_state_from_file(filepath: Path) -> tuple[list[dict], float] | None:
     amount = float(data.get("amount", 10_000))
 
     if applied:
-        # Applied state: use rebalance_result with new_held as current holdings.
-        # This represents the actual state of the portfolio after executing trades.
         result = data.get("rebalance_result", [])
         if not result:
             return None
         portfolio = [
             {
                 "ticker": r["ticker"],
-                "name": _name_cache.get(r["ticker"], r["ticker"].replace(".NS", "")),
-                "weight": r["weight"],
+                "weight": r.get("weight", 0),
                 "held": int(r.get("new_held", r.get("held", 0))),
                 "price": float(r.get("price", 0)),
+                "restricted": False,  # always reset on load
             }
             for r in result
         ]
     else:
-        # Unapplied state: use portfolio_before (the state BEFORE the hypothetical
-        # rebalance). This avoids loading phantom trades the user never executed.
         before = data.get("portfolio_before", [])
         if not before:
             return None
         portfolio = [
             {
                 "ticker": r["ticker"],
-                "name": _name_cache.get(r["ticker"], r["ticker"].replace(".NS", "")),
-                "weight": r["weight"],
+                "weight": r.get("weight", 0),
                 "held": int(r.get("held", 0)),
                 "price": float(r.get("price", 0)),
+                "restricted": False,
             }
             for r in before
         ]
 
-    return (portfolio, amount)
+    # Run through the compat layer to ensure all fields exist and names resolve
+    return (_ensure_portfolio_fields(portfolio), amount)
 
 
 def load_latest_applied_state(slug: str) -> tuple[list[dict], float] | None:
-    """
-    Load the most recent APPLIED state for a portfolio. This is used on
-    startup and when switching portfolios — we only auto-load confirmed states.
-    """
     for entry in list_state_files(slug):
         if entry["applied"]:
             return load_state_from_file(entry["path"])
@@ -491,7 +506,6 @@ def load_latest_applied_state(slug: str) -> tuple[list[dict], float] | None:
 
 
 def _cleanup_old_state_files(slug: str):
-    """Keep only the most recent MAX_STATE_FILES for a portfolio."""
     d = _portfolio_state_dir(slug)
     if not d.exists():
         return
@@ -505,24 +519,12 @@ def _cleanup_old_state_files(slug: str):
 
 # =============================================================================
 # 5. PANEL UI
-#
-#    Layout (top to bottom):
-#      Header
-#      Portfolio selector row  (dropdown + new portfolio input + create/delete)
-#      Status bar
-#      State history row       (dropdown + load button)
-#      Add / Remove stock row
-#      Portfolio table + action buttons
-#      Rebalance results
-#      Explanation
 # =============================================================================
 
 
-# ── Initialize: discover portfolios, pick the first one, load its state ──
+# ── Initialize ──
 _registry = load_portfolio_registry()
 _active_slug = _registry[0]["slug"]
-
-# Try loading the latest applied state for the active portfolio
 _init_state = load_latest_applied_state(_active_slug)
 portfolio_data: list[dict] = []
 _init_amount = 10_000.0
@@ -531,7 +533,7 @@ if _init_state:
     portfolio_data = _init_state[0]
     _init_amount = _init_state[1]
 else:
-    portfolio_data = _portfolio_with_names(DEFAULT_STOCKS)
+    portfolio_data = _ensure_portfolio_fields(DEFAULT_STOCKS)
 
 
 # ── Widgets: Portfolio management ──
@@ -539,13 +541,10 @@ else:
 portfolio_selector = pn.widgets.Select(
     name="Active Portfolio",
     options={p["name"]: p["slug"] for p in _registry},
-    value=_active_slug,
-    width=280,
+    value=_active_slug, width=280,
 )
 new_portfolio_input = pn.widgets.TextInput(
-    name="New Portfolio Name",
-    placeholder="e.g. Growth Portfolio",
-    width=250,
+    name="New Portfolio Name", placeholder="e.g. Growth Portfolio", width=250,
 )
 create_portfolio_btn = pn.widgets.Button(
     name="➕ Create Portfolio", button_type="success", width=180,
@@ -554,15 +553,10 @@ delete_portfolio_btn = pn.widgets.Button(
     name="🗑️ Delete Portfolio", button_type="danger", width=180,
 )
 
-
 # ── Widgets: State history ──
 
+
 def _build_state_options(slug: str) -> dict[str, str]:
-    """
-    Build the options dict for the state history dropdown. Keys are
-    human-readable labels, values are filenames. The first entry is always
-    a placeholder prompting the user to select a state.
-    """
     entries = list_state_files(slug)
     if not entries:
         return {"(No saved states)": ""}
@@ -574,13 +568,11 @@ def _build_state_options(slug: str) -> dict[str, str]:
 
 state_selector = pn.widgets.Select(
     name="State History",
-    options=_build_state_options(_active_slug),
-    width=550,
+    options=_build_state_options(_active_slug), width=600,
 )
 load_state_btn = pn.widgets.Button(
     name="📂 Load Selected State", button_type="primary", width=200,
 )
-
 
 # ── Widgets: Stock management ──
 
@@ -603,61 +595,144 @@ remove_input = pn.widgets.TextInput(
 )
 remove_btn = pn.widgets.Button(
     name="🗑️ Remove", button_type="danger", width=120)
+
+# ── Widgets: Trade restriction (separate from the table) ──
+# The restriction input works as a toggle: type a ticker and click the button.
+# If the ticker is currently unrestricted, it becomes restricted.
+# If already restricted, the restriction is lifted.
+restrict_input = pn.widgets.TextInput(
+    name="Restrict / Unrestrict Ticker",
+    placeholder="e.g. RELIANCE.NS (toggles restriction)",
+    width=300,
+)
+restrict_btn = pn.widgets.Button(
+    name="🔒 Toggle Restriction", button_type="warning", width=200,
+)
+
 fetch_btn = pn.widgets.Button(
     name="📡 Fetch Prices", button_type="success", width=160)
 calc_btn = pn.widgets.Button(
     name="🎯 Calculate Rebalance", button_type="warning", width=200)
 apply_btn = pn.widgets.Button(
-    name="✅ Apply Orders", button_type="primary", width=160,
-)
+    name="✅ Apply Orders", button_type="primary", width=160)
 
 
 # ── Display panes ──
 
 status_pane = pn.pane.Alert(
-    f"Loaded portfolio: {_registry[0]['name']}. Add stocks and fetch prices to begin.",
-    alert_type="info",
+    f"Loaded portfolio: {_registry[0]['name']}.", alert_type="info",
 )
+
+# Persistent weight warning banner — visible only when weights are invalid.
+# Unlike the status_pane (which changes on every action), this stays visible
+# as a constant reminder until the user fixes their weights.
+weight_warning_pane = pn.pane.Alert(
+    "", alert_type="danger", visible=False,
+)
+
+
+def _make_table_df(data: list[dict]) -> pd.DataFrame:
+    """
+    Build the DataFrame for the Tabulator. The 'restricted' column is
+    displayed as a read-only text indicator rather than an editable checkbox.
+    The user toggles restrictions via the dedicated input field instead.
+    """
+    rows = []
+    for d in data:
+        rows.append({
+            "ticker": d["ticker"],
+            "name": d["name"],
+            "weight": d["weight"],
+            "held": d["held"],
+            "price": d["price"],
+            # Display as a clear visual indicator, not a raw True/False
+            "restricted": "🔒 Yes" if d.get("restricted", False) else "",
+        })
+    return pd.DataFrame(rows)
+
+
 portfolio_table = pn.widgets.Tabulator(
-    pd.DataFrame(portfolio_data),
+    _make_table_df(portfolio_data),
     layout="fit_data_stretch",
     theme="midnight",
-    height=320,
+    height=340,
     selectable=False,
     show_index=False,
     titles={
         "ticker": "Ticker", "name": "Name", "weight": "Target Wt %",
-        "held": "Shares Held", "price": "Price ₹",
+        "held": "Shares Held", "price": "Price ₹", "restricted": "🔒 Status",
     },
     editors={
         "weight": {"type": "number", "step": 0.5, "min": 0, "max": 100},
         "held":   {"type": "number", "step": 1, "min": 0},
         "price":  {"type": "number", "step": 0.05, "min": 0},
+        # restricted column is NOT editable — it's controlled by the toggle button
+        "restricted": None,
     },
     frozen_columns=["ticker"],
+    widths={"restricted": 100, "weight": 110, "held": 110, "price": 100},
 )
+
 result_pane = pn.pane.HTML(
     "<i>No rebalance computed yet.</i>", sizing_mode="stretch_width",
 )
 
 
-# ── Global tracking for Apply ──
+# ── Global tracking ──
 last_result_df: pd.DataFrame | None = None
 last_saved_path: Path | None = None
 
 
-# ── Helper functions ──
+# ── Helpers ──
 
 def refresh_portfolio_table():
-    portfolio_table.value = pd.DataFrame(portfolio_data)
+    """Rebuild the table from portfolio_data. The restricted column is derived
+    from the in-memory data, so toggling a restriction just needs a refresh."""
+    portfolio_table.value = _make_table_df(portfolio_data)
 
 
 def refresh_state_dropdown():
-    """Refresh the state history dropdown for the currently active portfolio."""
     state_selector.options = _build_state_options(portfolio_selector.value)
 
 
+def _update_weight_warning():
+    """
+    Check whether the total of all non-zero weights is valid and update
+    the persistent warning banner accordingly. This runs after every action
+    that could change weights (add/remove stock, table edit, state load).
+
+    The warning banner stays visible as a constant reminder — unlike the
+    status bar which gets overwritten by the next action. This ensures
+    the user can't miss a weight problem even after doing other things.
+    """
+    total_w = sum(d["weight"] for d in portfolio_data if d["weight"] > 0)
+
+    if total_w > 100.1:
+        weight_warning_pane.object = (
+            f"⚠️ <b>Weights exceed 100%!</b> Non-zero weights sum to "
+            f"<b>{total_w:.1f}%</b>. This must be fixed before rebalancing — "
+            f"the algorithm cannot compute valid targets when weights exceed 100%. "
+            f"Please reduce some weights so they sum to exactly 100%."
+        )
+        weight_warning_pane.alert_type = "danger"
+        weight_warning_pane.visible = True
+    elif abs(total_w - 100) > 0.1 and len(portfolio_data) > 0:
+        weight_warning_pane.object = (
+            f"ℹ️ Non-zero weights sum to <b>{total_w:.1f}%</b> "
+            f"(need exactly 100% to rebalance)."
+        )
+        weight_warning_pane.alert_type = "warning"
+        weight_warning_pane.visible = True
+    else:
+        weight_warning_pane.visible = False
+
+
 def sync_edits_from_table():
+    """
+    Read back editable fields from the Tabulator into portfolio_data.
+    The restricted column is NOT synced here because it's read-only in the
+    table — restrictions are managed exclusively via the toggle button.
+    """
     edited = portfolio_table.value
     if edited is None or edited.empty:
         return
@@ -669,42 +744,32 @@ def sync_edits_from_table():
                 row.get("held", portfolio_data[i]["held"]))
             portfolio_data[i]["price"] = float(
                 row.get("price", portfolio_data[i]["price"]))
+    # After syncing edits, weights may have changed — update the warning
+    _update_weight_warning()
 
 
 def _load_portfolio_into_ui(slug: str, state: tuple[list[dict], float] | None):
-    """
-    Replace all in-memory portfolio data and refresh all UI elements to
-    reflect a portfolio switch or state load. This is the single point of
-    truth for "what does the UI show right now."
-    """
     global portfolio_data, last_result_df, last_saved_path
-
     if state:
         portfolio_data = state[0]
         monthly_input.value = state[1]
     else:
-        # No state found — start fresh with default stocks
-        portfolio_data = _portfolio_with_names(DEFAULT_STOCKS)
+        portfolio_data = _ensure_portfolio_fields(DEFAULT_STOCKS)
         monthly_input.value = 10_000
-
-    # Clear any pending rebalance (it belonged to the old portfolio/state)
     last_result_df = None
     last_saved_path = None
     result_pane.object = "<i>No rebalance computed yet.</i>"
-
     refresh_portfolio_table()
     refresh_state_dropdown()
+    _update_weight_warning()
 
 
 # ── Callbacks: Portfolio management ──
 
 def on_portfolio_switch(event):
-    """Called when the user selects a different portfolio from the dropdown."""
     slug = event.new
     state = load_latest_applied_state(slug)
     _load_portfolio_into_ui(slug, state)
-
-    # Find the display name for the status message
     registry = load_portfolio_registry()
     name = next((p["name"] for p in registry if p["slug"] == slug), slug)
     status_pane.object = f"📂 Switched to portfolio: {name}."
@@ -712,116 +777,140 @@ def on_portfolio_switch(event):
 
 
 def on_create_portfolio(event):
-    """Create a new portfolio and switch to it."""
     name = new_portfolio_input.value.strip()
     if not name:
         status_pane.object = "⚠️ Please enter a name for the new portfolio."
         status_pane.alert_type = "warning"
         return
-
     entry = add_portfolio_to_registry(name)
     if entry is None:
         status_pane.object = f"⚠️ A portfolio named '{name}' (or similar) already exists."
         status_pane.alert_type = "warning"
         return
-
-    # Update the dropdown options and switch to the new portfolio
     registry = load_portfolio_registry()
     portfolio_selector.options = {p["name"]: p["slug"] for p in registry}
     portfolio_selector.value = entry["slug"]
-
-    # Start with default stocks for the new portfolio
     _load_portfolio_into_ui(entry["slug"], None)
-
     new_portfolio_input.value = ""
-    status_pane.object = f"✅ Created new portfolio: {name}. Add your stocks and set weights."
+    status_pane.object = f"✅ Created: {name}. Add stocks and set weights."
     status_pane.alert_type = "success"
 
 
 def on_delete_portfolio(event):
-    """
-    Delete the currently active portfolio. We prevent deleting the last
-    remaining portfolio to avoid a broken state.
-    """
     slug = portfolio_selector.value
     registry = load_portfolio_registry()
     if len(registry) <= 1:
         status_pane.object = "⚠️ Cannot delete the last remaining portfolio."
         status_pane.alert_type = "danger"
         return
-
     name = next((p["name"] for p in registry if p["slug"] == slug), slug)
-
-    # Remove from registry
     delete_portfolio_from_registry(slug)
-
-    # Optionally clean up state files on disk
     d = _portfolio_state_dir(slug)
     if d.exists():
         import shutil
         shutil.rmtree(d, ignore_errors=True)
-
-    # Switch to the first remaining portfolio
     registry = load_portfolio_registry()
     portfolio_selector.options = {p["name"]: p["slug"] for p in registry}
     portfolio_selector.value = registry[0]["slug"]
-
     state = load_latest_applied_state(registry[0]["slug"])
     _load_portfolio_into_ui(registry[0]["slug"], state)
-
-    status_pane.object = f"🗑️ Deleted portfolio: {name}. Switched to {registry[0]['name']}."
+    status_pane.object = f"🗑️ Deleted: {name}. Switched to {registry[0]['name']}."
     status_pane.alert_type = "info"
 
 
 # ── Callbacks: State history ──
 
 def on_load_state(event):
-    """
-    Load a specific historical state into the UI. This works for both applied
-    and unapplied states — the key difference is which holdings get loaded
-    (see load_state_from_file docstring for details).
-    """
     filename = state_selector.value
     if not filename:
-        status_pane.object = "⚠️ Please select a state from the dropdown first."
+        status_pane.object = "⚠️ Please select a state from the dropdown."
         status_pane.alert_type = "warning"
         return
-
     slug = portfolio_selector.value
     filepath = _portfolio_state_dir(slug) / filename
-
     if not filepath.exists():
         status_pane.object = f"⚠️ State file not found: {filename}"
         status_pane.alert_type = "danger"
         return
-
     state = load_state_from_file(filepath)
     if state is None:
-        status_pane.object = f"⚠️ Could not parse state file: {filename}"
+        status_pane.object = f"⚠️ Could not parse: {filename}"
         status_pane.alert_type = "danger"
         return
-
     _load_portfolio_into_ui(slug, state)
 
-    # Check if this was an applied or unapplied state for the message
+    # Show which tickers were restricted in the historical state (informational)
     try:
         with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
         applied = data.get("applied", False)
+        hist_restricted = data.get("restricted_tickers", [])
     except Exception:
         applied = False
+        hist_restricted = []
+
+    restriction_note = ""
+    if hist_restricted:
+        restriction_note = f" Restrictions that month: {', '.join(hist_restricted)}."
 
     if applied:
         status_pane.object = (
             f"📂 Loaded applied state from {filename}. "
-            "This reflects your portfolio after those trades were executed."
+            f"Shows post-trade holdings.{restriction_note}"
         )
     else:
         status_pane.object = (
             f"📂 Loaded unapplied state from {filename}. "
-            "This shows the portfolio BEFORE that rebalance (trades were never confirmed)."
+            f"Shows pre-trade holdings.{restriction_note}"
         )
     status_pane.alert_type = "info"
+
+
+# ── Callbacks: Trade restrictions ──
+
+def on_toggle_restriction(event):
+    """
+    Toggle the restriction status of a ticker. The same button both adds and
+    removes restrictions, which is simpler than having separate actions. The
+    user types a ticker and clicks — if it's unrestricted, it becomes
+    restricted; if already restricted, the restriction is lifted.
+    """
+    sync_edits_from_table()
+    ticker = restrict_input.value.strip().upper()
+    if not ticker:
+        status_pane.object = "⚠️ Please enter a ticker to restrict/unrestrict."
+        status_pane.alert_type = "warning"
+        return
+    if not ticker.endswith(".NS") and not ticker.endswith(".BO"):
+        ticker += ".NS"
+
+    # Find the ticker in portfolio_data
+    found = False
+    for d in portfolio_data:
+        if d["ticker"] == ticker:
+            found = True
+            was_restricted = d.get("restricted", False)
+            d["restricted"] = not was_restricted
+            if d["restricted"]:
+                status_pane.object = (
+                    f"🔒 Restricted {ticker}. It will be frozen during this "
+                    f"month's rebalance — no buys or sells."
+                )
+            else:
+                status_pane.object = (
+                    f"🔓 Unrestricted {ticker}. It will participate in "
+                    f"rebalancing normally."
+                )
+            status_pane.alert_type = "info"
+            break
+
+    if not found:
+        status_pane.object = f"⚠️ {ticker} is not in your portfolio."
+        status_pane.alert_type = "warning"
+        return
+
+    restrict_input.value = ""
+    refresh_portfolio_table()
 
 
 # ── Callbacks: Stock management ──
@@ -841,34 +930,38 @@ def on_add_stock(event):
         return
     name = name_for_ticker(ticker)
     portfolio_data.append({
-        "ticker": ticker, "name": name,
-        "weight": weight_input.value, "held": held_input.value, "price": 0.0,
+        "ticker": ticker, "name": name, "weight": weight_input.value,
+        "held": held_input.value, "price": 0.0, "restricted": False,
     })
     refresh_portfolio_table()
+    _update_weight_warning()
     ticker_input.value = ""
-    total_w = sum(d["weight"] for d in portfolio_data)
-    status_pane.object = f"✅ Added {ticker}. Total active weight: {total_w:.1f}%"
+    total_w = sum(d["weight"] for d in portfolio_data if d["weight"] > 0)
+    status_pane.object = f"✅ Added {ticker}. Total weight: {total_w:.1f}%"
     status_pane.alert_type = "success"
 
 
 def on_remove_stock(event):
     sync_edits_from_table()
     ticker = remove_input.value.strip().upper()
+    if not ticker.endswith(".NS") and not ticker.endswith(".BO"):
+        ticker += ".NS"
     before = len(portfolio_data)
     portfolio_data[:] = [d for d in portfolio_data if d["ticker"] != ticker]
     if len(portfolio_data) < before:
         refresh_portfolio_table()
+        _update_weight_warning()
         remove_input.value = ""
         status_pane.object = f"🗑️ Removed {ticker}."
         status_pane.alert_type = "info"
     else:
-        status_pane.object = f"⚠️ {ticker} not found in portfolio."
+        status_pane.object = f"⚠️ {ticker} not found."
         status_pane.alert_type = "warning"
 
 
 def on_fetch_prices(event):
     sync_edits_from_table()
-    status_pane.object = "📡 Fetching prices... this may take a few seconds."
+    status_pane.object = "📡 Fetching prices..."
     status_pane.alert_type = "info"
     tickers = [d["ticker"] for d in portfolio_data]
     prices = fetch_all_prices(tickers)
@@ -881,15 +974,10 @@ def on_fetch_prices(event):
             failed.append(d["ticker"])
     refresh_portfolio_table()
     if failed:
-        status_pane.object = (
-            f"⚠️ Prices updated, but failed for: {', '.join(failed)}. "
-            "Edit manually in the table."
-        )
+        status_pane.object = f"⚠️ Failed for: {', '.join(failed)}. Edit manually."
         status_pane.alert_type = "warning"
     else:
-        status_pane.object = (
-            f"✅ All {len(tickers)} prices fetched at {datetime.now():%H:%M:%S}."
-        )
+        status_pane.object = f"✅ {len(tickers)} prices fetched at {datetime.now():%H:%M:%S}."
         status_pane.alert_type = "success"
 
 
@@ -897,23 +985,40 @@ def on_calculate(event):
     global last_result_df, last_saved_path
     sync_edits_from_table()
 
-    active_w = sum(d["weight"] for d in portfolio_data if d["weight"] > 0)
-    if abs(active_w - 100) > 0.1:
+    # ── Weight validation ──
+    # This is the critical guard: if non-zero weights exceed 100%, the
+    # algorithm would compute target values that exceed the total portfolio
+    # value, generating impossible buy orders. We block this with a clear
+    # message explaining WHY it doesn't make sense.
+    total_nonzero_w = sum(d["weight"]
+                          for d in portfolio_data if d["weight"] > 0)
+
+    if total_nonzero_w > 100.1:
         status_pane.object = (
-            f"⚠️ Active weights sum to {active_w:.1f}%, must be 100%."
+            f"⛔ Cannot rebalance: weights sum to {total_nonzero_w:.1f}% which "
+            f"exceeds 100%. Each stock's target value would exceed the portfolio's "
+            f"total value, making the math impossible. Please reduce weights first."
         )
         status_pane.alert_type = "danger"
+        _update_weight_warning()
         return
 
+    if abs(total_nonzero_w - 100) > 0.1:
+        status_pane.object = (
+            f"⚠️ Non-zero weights sum to {total_nonzero_w:.1f}%, need exactly 100%."
+        )
+        status_pane.alert_type = "danger"
+        _update_weight_warning()
+        return
+
+    # Price needed for any stock that's active, a liquidation candidate,
+    # or restricted with holdings (we need its value for target computation).
     needs_price = [
         d["ticker"] for d in portfolio_data
         if d["price"] <= 0 and (d["weight"] > 0 or d["held"] > 0)
     ]
     if needs_price:
-        status_pane.object = (
-            f"⚠️ Missing prices for: {', '.join(needs_price)}. "
-            "Fetch or enter manually."
-        )
+        status_pane.object = f"⚠️ Missing prices for: {', '.join(needs_price)}."
         status_pane.alert_type = "danger"
         return
 
@@ -923,15 +1028,11 @@ def on_calculate(event):
     last_result_df = result
 
     saved = save_rebalance_state(
-        slug=slug,
-        amount=monthly_input.value,
+        slug=slug, amount=monthly_input.value,
         portfolio=[{**d} for d in portfolio_data],
-        result=result,
-        applied=False,
+        result=result, applied=False,
     )
     last_saved_path = saved
-
-    # Refresh the state dropdown so the new entry appears immediately
     refresh_state_dropdown()
 
     # ── Build HTML results ──
@@ -940,17 +1041,33 @@ def on_calculate(event):
     liq_val = result["sell_value"].sum()
     available = monthly_input.value + liq_val
     leftover = available - total_invested
+
     n_sells = int((result["sell_qty"] > 0).sum())
     n_buys = int((result["buy_qty"] > 0).sum())
+    n_restricted = int((result["category"] == "RESTRICTED").sum())
+    restricted_val = result.loc[result["category"]
+                                == "RESTRICTED", "current_value"].sum()
 
+    # ── Summary cards ──
     liq_card = ""
     if liq_val > 0:
         liq_card = f"""
         <div style="background:#2a1a1a; padding:12px 18px; border-radius:8px;
-                    min-width:150px; border:1px solid #7f1d1d;">
+                    min-width:140px; border:1px solid #7f1d1d;">
           <div style="font-size:11px; color:#f87171; text-transform:uppercase;">
-            Liquidation ({n_sells} stock{'s' if n_sells != 1 else ''})</div>
+            Liquidation ({n_sells})</div>
           <div style="font-size:20px; font-weight:700; color:#f87171;">₹{liq_val:,.0f}</div>
+        </div>"""
+
+    restricted_card = ""
+    if n_restricted > 0:
+        restricted_card = f"""
+        <div style="background:#2a2a1a; padding:12px 18px; border-radius:8px;
+                    min-width:140px; border:1px solid #92400e;">
+          <div style="font-size:11px; color:#fbbf24; text-transform:uppercase;">
+            🔒 Restricted ({n_restricted})</div>
+          <div style="font-size:20px; font-weight:700; color:#fbbf24;">₹{restricted_val:,.0f}</div>
+          <div style="font-size:11px; color:#92400e; margin-top:2px;">frozen this month</div>
         </div>"""
 
     summary_html = f"""
@@ -964,6 +1081,7 @@ def on_calculate(event):
         <div style="font-size:20px; font-weight:700; color:#34d399;">₹{monthly_input.value:,.0f}</div>
       </div>
       {liq_card}
+      {restricted_card}
       <div style="background:#1a2332; padding:12px 18px; border-radius:8px; min-width:140px;">
         <div style="font-size:11px; color:#888; text-transform:uppercase;">Total Cash</div>
         <div style="font-size:20px; font-weight:700; color:#a78bfa;">₹{available:,.0f}</div>
@@ -978,20 +1096,27 @@ def on_calculate(event):
       </div>
     </div>"""
 
+    # ── Orders table ──
     rows_html = ""
     for _, r in result.iterrows():
+        cat = r["category"]
         is_sell = int(r["sell_qty"]) > 0
         is_buy = int(r["buy_qty"]) > 0
-        bg = "background:#2a1015;" if is_sell else (
-            "background:#0d1a0d;" if is_buy else "")
 
-        if is_sell:
+        if cat == "RESTRICTED":
+            bg = "background:#2a2a15;"
+            act = '<span style="color:#fbbf24;font-weight:700;">🔒 RESTRICTED</span>'
+            cf = '<span style="color:#92400e;">frozen</span>'
+        elif is_sell:
+            bg = "background:#2a1015;"
             act = f'<span style="color:#f87171;font-weight:700;">🔴 SELL {int(r["sell_qty"])}</span>'
             cf = f'<span style="color:#f87171;">+₹{r["sell_value"]:,.0f}</span>'
         elif is_buy:
+            bg = "background:#0d1a0d;"
             act = f'<span style="color:#34d399;font-weight:700;">🟢 BUY {int(r["buy_qty"])}</span>'
             cf = f'<span style="color:#60a5fa;">−₹{r["buy_cost"]:,.0f}</span>'
         else:
+            bg = ""
             act = '<span style="color:#666;">—</span>'
             cf = '<span style="color:#666;">—</span>'
 
@@ -1016,7 +1141,8 @@ def on_calculate(event):
     hdrs = ["Ticker", "Name", "Price", "Target", "Current",
             "Drift", "Action", "Cash Flow", "New Held", "New Wt"]
     table_html = f"""
-    <table style="width:100%;border-collapse:collapse;font-size:13px;background:#111827;border-radius:8px;overflow:hidden;">
+    <table style="width:100%;border-collapse:collapse;font-size:13px;
+                  background:#111827;border-radius:8px;overflow:hidden;">
       <thead><tr style="background:#0d1525;">
         {''.join(f'<th style="padding:9px;text-align:left;color:#888;font-size:11px;text-transform:uppercase;">{h}</th>' for h in hdrs)}
       </tr></thead>
@@ -1030,9 +1156,11 @@ def on_calculate(event):
         parts.append(f"{n_sells} sell{'s' if n_sells != 1 else ''}")
     if n_buys:
         parts.append(f"{n_buys} buy{'s' if n_buys != 1 else ''}")
+    if n_restricted:
+        parts.append(f"{n_restricted} restricted")
     status_pane.object = (
         f"🎯 Rebalance: {' + '.join(parts) or 'no orders'}. "
-        f"Saved to {saved.name}. Click Apply after executing trades."
+        f"Saved to {saved.name}."
     )
     status_pane.alert_type = "success"
 
@@ -1044,47 +1172,58 @@ def on_apply(event):
         status_pane.alert_type = "warning"
         return
 
+    # Update holdings. Restricted stocks have new_held == held (unchanged).
     for _, r in last_result_df.iterrows():
         for d in portfolio_data:
             if d["ticker"] == r["ticker"]:
                 d["held"] = int(r["new_held"])
 
+    # Remove fully liquidated stocks
     liquidated = [d["ticker"]
                   for d in portfolio_data if d["weight"] == 0 and d["held"] == 0]
     portfolio_data[:] = [d for d in portfolio_data if not (
         d["weight"] == 0 and d["held"] == 0)]
+
+    # Clear all restrictions (they're a one-month decision)
+    for d in portfolio_data:
+        d["restricted"] = False
 
     if last_saved_path and last_saved_path.exists():
         mark_state_applied(last_saved_path)
 
     refresh_portfolio_table()
     refresh_state_dropdown()
+    _update_weight_warning()
     last_result_df = None
     last_saved_path = None
 
     liq_msg = f" Removed: {', '.join(liquidated)}." if liquidated else ""
-    result_pane.object = "<i>Orders applied. Holdings updated. Ready for next month!</i>"
-    status_pane.object = f"✅ Holdings updated.{liq_msg}"
+    result_pane.object = "<i>Orders applied. Holdings updated. Restrictions cleared.</i>"
+    status_pane.object = f"✅ Holdings updated. Restrictions cleared.{liq_msg}"
     status_pane.alert_type = "success"
 
 
-# ── Wire up all callbacks ──
+# ── Wire up callbacks ──
 portfolio_selector.param.watch(on_portfolio_switch, "value")
 create_portfolio_btn.on_click(on_create_portfolio)
 delete_portfolio_btn.on_click(on_delete_portfolio)
 load_state_btn.on_click(on_load_state)
+restrict_btn.on_click(on_toggle_restriction)
 add_btn.on_click(on_add_stock)
 remove_btn.on_click(on_remove_stock)
 fetch_btn.on_click(on_fetch_prices)
 calc_btn.on_click(on_calculate)
 apply_btn.on_click(on_apply)
 
+# Run initial weight check so the banner shows on startup if needed
+_update_weight_warning()
+
 # =============================================================================
 # 6. LAYOUT
 # =============================================================================
 header = pn.pane.Markdown(
     "# 📊 Portfolio Rebalancer\n"
-    "*Multi-portfolio SIP rebalancing with live NSE prices via yFinance*",
+    "*Multi-portfolio SIP rebalancing · live NSE prices · trade restrictions*",
     styles={"border-bottom": "1px solid #333", "padding-bottom": "8px"},
 )
 
@@ -1095,22 +1234,26 @@ portfolio_row = pn.Row(
 state_row = pn.Row(state_selector, load_state_btn, align="end")
 add_row = pn.Row(ticker_input, weight_input, held_input, add_btn, align="end")
 remove_row = pn.Row(remove_input, remove_btn, align="end")
+restrict_row = pn.Row(restrict_input, restrict_btn, align="end")
 controls = pn.Row(monthly_input, fetch_btn, calc_btn, apply_btn, align="end")
 
 explanation = pn.pane.Markdown("""
 ---
 ### How it works
+
 1. **Create a portfolio** or pick an existing one from the dropdown.
-2. **Define** stocks + weights (active weights must sum to 100%).
-3. **Fetch** live prices (or type them manually).
-4. **Calculate** — your monthly SIP is directed toward the most underweight stocks.
-5. **Liquidate** — set weight to **0%** to sell everything. Proceeds are redeployed.
-6. **Apply** — after executing trades in your broker, click Apply to confirm.
-7. **Load history** — use the state dropdown to view or roll back to any past state.
-8. **Repeat** next month!
+2. **Define** stocks + weights (non-zero weights must sum to exactly 100%).
+3. **Fetch** live prices (or type them manually in the table).
+4. **Restrict** — type a ticker and click 🔒 Toggle to freeze it for this month.
+   Restricted stocks cannot be bought or sold. Click again to unrestrict.
+5. **Calculate** — your monthly SIP goes toward the most underweight unrestricted stocks.
+6. **Liquidate** — set weight to **0%** to sell everything (only if not restricted).
+7. **Apply** — after executing trades in your broker, click Apply.
+   Restrictions auto-clear (they're a one-month decision).
+8. **Load history** — use the state dropdown to review or roll back to any past state.
 
 *Ticker format: `.NS` for NSE, `.BO` for BSE (auto-appended if missing).
-Each portfolio's state is saved independently under `state/{portfolio}/`.*
+Restrictions are saved in state files for audit but reset each session.*
 """)
 
 layout = pn.Column(
@@ -1118,18 +1261,20 @@ layout = pn.Column(
     pn.pane.Markdown("### 🗂️ Portfolio"),
     portfolio_row,
     status_pane,
+    weight_warning_pane,   # persistent warning banner — only visible when weights are invalid
     pn.pane.Markdown("### 📜 State History"),
     state_row,
-    pn.pane.Markdown("### ➕ Add / Remove Stocks"),
+    pn.pane.Markdown("### ➕ Add / Remove / Restrict Stocks"),
     add_row,
     remove_row,
+    restrict_row,
     pn.pane.Markdown("### 📋 Holdings & Actions"),
     controls,
     portfolio_table,
     pn.pane.Markdown("### 🎯 Rebalance Orders"),
     result_pane,
     explanation,
-    max_width=1050,
+    max_width=1100,
     styles={"margin": "0 auto", "padding": "20px"},
 )
 
