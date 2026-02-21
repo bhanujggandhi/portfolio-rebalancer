@@ -24,14 +24,22 @@ import pandas as pd
 pn.extension("tabulator", sizing_mode="stretch_width")
 
 # =============================================================================
-# 1. TICKER DISPLAY NAMES — fetched from yFinance using ticker symbol
+# 1. TICKER DISPLAY NAMES
+#
+#    Names are fetched from yFinance the first time we see a ticker, then
+#    cached both in-memory (_name_cache) and on-disk (state file) so that
+#    subsequent startups don't require any API calls just for display names.
 # =============================================================================
 
 _name_cache: dict[str, str] = {}
 
 
 def name_for_ticker(ticker: str) -> str:
-    """Get display name for a ticker, fetched from yFinance. Results are cached."""
+    """
+    Get display name for a ticker. Check the in-memory cache first, then
+    call yFinance if needed. The result is cached so each ticker only ever
+    triggers one API call across the lifetime of the process.
+    """
     if ticker in _name_cache:
         return _name_cache[ticker]
     try:
@@ -42,19 +50,72 @@ def name_for_ticker(ticker: str) -> str:
             return name
     except Exception:
         pass
+    # Fallback: strip the exchange suffix and use the raw symbol
     fallback = ticker.replace(".NS", "").replace(".BO", "")
     _name_cache[ticker] = fallback
     return fallback
 
 # =============================================================================
-# 2. PRICE FETCHING — robust fallback chain
-#    First tries .info['currentPrice'], then falls back to last close from
-#    5-day history. This handles weekends/holidays gracefully.
+# 2. PRICE FETCHING
+#
+#    Uses yf.download() for batch fetching (one HTTP call for all tickers)
+#    which is dramatically faster than individual Ticker().info calls.
+#    Falls back to per-ticker fetching only if the batch approach fails.
 # =============================================================================
 
 
-def fetch_price(ticker_symbol: str) -> float | None:
-    """Fetch the latest available price for an NSE ticker via yFinance."""
+def fetch_all_prices(tickers: list[str]) -> dict[str, float | None]:
+    """
+    Fetch prices for multiple tickers in a single batch call via yf.download().
+    Returns {symbol: price_or_None}.
+
+    The batch approach is ~5-10x faster than sequential per-ticker calls because
+    yFinance sends one HTTP request to Yahoo's API for all symbols at once.
+    """
+    prices: dict[str, float | None] = {t: None for t in tickers}
+    if not tickers:
+        return prices
+
+    try:
+        # yf.download returns a DataFrame with MultiIndex columns when
+        # multiple tickers are requested: (field, ticker).
+        # For a single ticker it returns simple columns, so we handle both.
+        df = yf.download(tickers, period="5d", progress=False, threads=True)
+
+        if df.empty:
+            return prices
+
+        for t in tickers:
+            try:
+                if len(tickers) == 1:
+                    # Single ticker: columns are just ["Open","High",...,"Close",...]
+                    close_series = df["Close"]
+                else:
+                    # Multiple tickers: columns are MultiIndex (field, ticker)
+                    close_series = df["Close"][t]
+
+                # Drop NaN and take the most recent valid close
+                valid = close_series.dropna()
+                if not valid.empty:
+                    prices[t] = round(float(valid.iloc[-1]), 2)
+            except (KeyError, IndexError):
+                continue
+
+    except Exception as e:
+        print(
+            f"[WARN] Batch download failed: {e}. Falling back to per-ticker fetch.")
+        # Fallback: fetch one at a time (slower but more resilient)
+        for t in tickers:
+            prices[t] = _fetch_price_single(t)
+
+    return prices
+
+
+def _fetch_price_single(ticker_symbol: str) -> float | None:
+    """
+    Fallback: fetch price for a single ticker via Ticker.info, then history.
+    Only used if the batch yf.download() fails entirely.
+    """
     try:
         tk = yf.Ticker(ticker_symbol)
         info = tk.info or {}
@@ -68,32 +129,22 @@ def fetch_price(ticker_symbol: str) -> float | None:
         print(f"[WARN] Could not fetch price for {ticker_symbol}: {e}")
     return None
 
-
-def fetch_all_prices(tickers: list[str]) -> dict[str, float | None]:
-    """Fetch prices for multiple tickers. Returns {symbol: price}."""
-    return {t: fetch_price(t) for t in tickers}
-
 # =============================================================================
 # 3. REBALANCING LOGIC (with liquidation support)
 #
-#    The algorithm handles two distinct cases:
+#    Two cases handled:
 #
-#    CASE A — Active stocks (weight > 0):
-#      These are stocks you want to keep holding. The algorithm calculates how
-#      far each is from its target allocation and directs new money toward the
-#      most underweight ones. It only buys, never sells active stocks.
+#    ACTIVE stocks (weight > 0):
+#      The algorithm calculates how far each is from its target allocation
+#      and directs new money toward the most underweight ones. Buy-only for
+#      active stocks — we never sell them, just stop buying overweight ones.
 #
-#    CASE B — Liquidation stocks (weight == 0 AND held > 0):
-#      Setting a stock's weight to 0% while holding shares is the signal to
-#      exit that position entirely. The algorithm marks all held shares as a
-#      SELL order and adds the proceeds to the available cash pool. This means
-#      the remaining active stocks get more money to rebalance with.
+#    LIQUIDATION stocks (weight == 0 AND held > 0):
+#      Setting weight to 0% while holding shares is the signal to exit.
+#      All held shares become a SELL order, and the proceeds join the cash
+#      pool available for buying active stocks.
 #
-#    The cash pool formula is:
-#      available_cash = new_monthly_sip + sum(liquidation_proceeds)
-#
-#    This ensures the sell proceeds are immediately redeployed into the
-#    portfolio rather than sitting idle.
+#    Cash pool = new_monthly_sip + sum(liquidation_proceeds)
 # =============================================================================
 
 
@@ -104,51 +155,39 @@ def calculate_rebalance(
     """
     Given a portfolio and new cash to invest, return a DataFrame with buy AND
     sell orders that push allocations toward target weights.
-
-    Returns a DataFrame with these added columns:
-      - sell_qty, sell_value : shares to sell and their proceeds
-      - buy_qty, buy_cost   : shares to buy and their cost
-      - new_held, new_value : post-rebalance position
-      - current_weight, new_weight, drift : weight analysis
     """
     df = portfolio.copy()
     df["current_value"] = df["held"] * df["price"]
 
-    # ── Step 1: Identify liquidations (weight=0, but holding shares) ──
-    # These are exit signals. We sell everything and reclaim the cash.
+    # ── Step 1: Identify liquidations (weight=0 AND actually holding shares) ──
+    # Stocks with weight=0 and held=0 are inert — no action needed on them.
     is_liquidation = (df["weight"] == 0) & (df["held"] > 0)
     df["sell_qty"] = 0
     df.loc[is_liquidation, "sell_qty"] = df.loc[is_liquidation, "held"]
     df["sell_value"] = df["sell_qty"] * df["price"]
     liquidation_proceeds = df["sell_value"].sum()
 
-    # ── Step 2: Compute total available cash ──
-    # Fresh SIP money + whatever we're recovering from liquidated positions.
+    # ── Step 2: Available cash = fresh SIP + recovered liquidation money ──
     available_cash = new_cash + liquidation_proceeds
 
     # ── Step 3: Rebalance only active stocks (weight > 0) ──
     active = df["weight"] > 0
-
-    # The target portfolio size is the value of active holdings + all available cash.
-    # We exclude liquidation stocks from the "current" base because they're being sold.
     active_current_value = df.loc[active, "current_value"].sum()
     total_target = active_current_value + available_cash
 
-    # What each active stock *should* be worth after rebalancing
     df["target_value"] = 0.0
     df.loc[active, "target_value"] = total_target * \
         (df.loc[active, "weight"] / 100.0)
 
-    # How much each active stock is underweight (deficit). Overweight stocks
-    # get deficit=0 — we never sell active stocks, just stop buying them.
+    # Deficit: how much each active stock is underweight. Overweight stocks
+    # get deficit=0 — we never sell active stocks, we just don't buy more.
     df["deficit"] = 0.0
     df.loc[active, "deficit"] = (
         df.loc[active, "target_value"] - df.loc[active, "current_value"]
     ).clip(lower=0)
     total_deficit = df.loc[active, "deficit"].sum()
 
-    # Distribute available_cash proportionally to deficits.
-    # Stocks that are more underweight get a bigger share.
+    # Distribute available_cash proportionally to deficits
     df["allocation"] = 0.0
     if total_deficit > 0:
         df.loc[active, "allocation"] = (
@@ -156,7 +195,7 @@ def calculate_rebalance(
         ) * available_cash
     else:
         # Edge case: all active stocks are at or above target weight.
-        # Fall back to splitting by target weights (still buy-only).
+        # Split by target weights as a fallback.
         active_weight_sum = df.loc[active, "weight"].sum()
         if active_weight_sum > 0:
             df.loc[active, "allocation"] = (
@@ -165,19 +204,17 @@ def calculate_rebalance(
 
     # ── Step 4: Convert allocations to whole-share buy orders ──
     df["buy_qty"] = 0
-    # Guard against division by zero for stocks with price=0
     valid_buy = active & (df["price"] > 0)
     df.loc[valid_buy, "buy_qty"] = (
         df.loc[valid_buy, "allocation"] / df.loc[valid_buy, "price"]
     ).apply(math.floor).astype(int)
-
     df["buy_cost"] = df["buy_qty"] * df["price"]
 
-    # ── Step 5: Compute post-rebalance state ──
+    # ── Step 5: Post-rebalance state ──
     df["new_held"] = df["held"] + df["buy_qty"] - df["sell_qty"]
     df["new_value"] = df["new_held"] * df["price"]
 
-    # ── Step 6: Weight analysis (before vs after) ──
+    # ── Step 6: Weight analysis ──
     total_current = df["current_value"].sum()
     new_total = df["new_value"].sum()
 
@@ -195,11 +232,183 @@ def calculate_rebalance(
     return df
 
 # =============================================================================
-# 4. PANEL UI — all widgets, callbacks, and layout
+# 4. STATE PERSISTENCE
+#
+#    Design:
+#    - Each rebalance run is saved as a dated JSON file in ./state/
+#    - A separate "applied" flag is written ONLY when the user clicks Apply
+#    - On startup, we load the latest file that was actually applied
+#    - Ticker names are persisted in state to avoid API calls on startup
+#    - Old state files are retained for audit/history (configurable cleanup)
+#
+#    File structure:
+#    {
+#      "timestamp": "...",
+#      "applied": false,          <-- flipped to true on Apply
+#      "amount": 10000,
+#      "portfolio_before": [...],
+#      "rebalance_result": [...],
+#      "summary": {...},
+#      "ticker_names": {"RELIANCE.NS": "Reliance Industries", ...}
+#    }
 # =============================================================================
 
 
-# ---- Default portfolio (used only when no state file exists) ----
+STATE_DIR = Path(__file__).resolve().parent / "state"
+MAX_STATE_FILES = 50  # Keep the last N state files, delete older ones
+
+
+def _to_jsonable(v):
+    """Convert pandas/numpy types to JSON-safe Python types."""
+    if hasattr(v, "item"):  # numpy scalar (int64, float64, etc.)
+        v = v.item()
+    if isinstance(v, float):
+        # NaN check: NaN != NaN in IEEE 754. Convert to None for JSON.
+        return None if v != v else round(v, 4)
+    if isinstance(v, int) and not isinstance(v, bool):
+        return int(v)
+    return v
+
+
+def save_rebalance_state(
+    amount: float,
+    portfolio: list[dict],
+    result: pd.DataFrame,
+    applied: bool = False,
+) -> Path:
+    """
+    Persist rebalance data to a dated JSON file. The 'applied' flag indicates
+    whether the user has confirmed execution of the trades. On startup, we
+    only restore state from files where applied=True.
+    """
+    STATE_DIR.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    filepath = STATE_DIR / f"rebalance_{ts}.json"
+
+    result_records = [
+        {k: _to_jsonable(v) for k, v in row.to_dict().items()}
+        for _, row in result.iterrows()
+    ]
+
+    liquidation_total = float(result["sell_value"].sum())
+
+    # Persist ticker names so startup doesn't need API calls
+    ticker_names = {d["ticker"]: _name_cache.get(
+        d["ticker"], d.get("name", "")) for d in portfolio}
+
+    data = {
+        "timestamp": datetime.now().isoformat(),
+        "applied": applied,
+        "amount": amount,
+        "portfolio_before": portfolio,
+        "rebalance_result": result_records,
+        "summary": {
+            "current_value": float(result["current_value"].sum()),
+            "total_invested": float(result["buy_cost"].sum()),
+            "liquidation_proceeds": liquidation_total,
+            "available_cash": amount + liquidation_total,
+            "leftover": float(
+                (amount + liquidation_total) - result["buy_cost"].sum()
+            ),
+        },
+        "ticker_names": ticker_names,
+    }
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+
+    # Housekeeping: keep only the most recent N state files
+    _cleanup_old_state_files()
+
+    return filepath
+
+
+def mark_state_applied(filepath: Path):
+    """
+    Flip the 'applied' flag to True in an existing state file. Called when
+    the user clicks Apply, so we know this state represents real trades.
+    """
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            data = json.load(f)
+        data["applied"] = True
+        data["applied_at"] = datetime.now().isoformat()
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] Could not mark state as applied: {e}")
+
+
+def load_latest_state() -> tuple[list[dict], float] | None:
+    """
+    Load the most recent APPLIED rebalance state. We deliberately skip files
+    where applied=False, because those represent calculations the user never
+    confirmed — loading them would show phantom trades that never happened.
+
+    Returns (portfolio, amount) or None if no applied state exists.
+    """
+    if not STATE_DIR.exists():
+        return None
+
+    # Sort by filename (which embeds the timestamp) in reverse chronological order
+    files = sorted(STATE_DIR.glob("rebalance_*.json"), reverse=True)
+
+    for filepath in files:
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        # Skip un-applied states — they represent "what-if" calculations
+        if not data.get("applied", False):
+            continue
+
+        result = data.get("rebalance_result", [])
+        if not result:
+            continue
+
+        # Restore ticker name cache from state file to avoid API calls
+        saved_names = data.get("ticker_names", {})
+        for ticker, name in saved_names.items():
+            if name and ticker not in _name_cache:
+                _name_cache[ticker] = name
+
+        # Reconstruct portfolio from the post-rebalance state
+        portfolio = []
+        for r in result:
+            ticker = r["ticker"]
+            portfolio.append({
+                "ticker": ticker,
+                "name": _name_cache.get(ticker, ticker.replace(".NS", "")),
+                "weight": r["weight"],
+                "held": int(r.get("new_held", r.get("held", 0))),
+                "price": float(r.get("price", 0)),
+            })
+
+        amount = float(data.get("amount", 10_000))
+        return (portfolio, amount)
+
+    return None
+
+
+def _cleanup_old_state_files():
+    """Remove state files beyond the MAX_STATE_FILES limit (oldest first)."""
+    if not STATE_DIR.exists():
+        return
+    files = sorted(STATE_DIR.glob("rebalance_*.json"))
+    if len(files) > MAX_STATE_FILES:
+        for old_file in files[: len(files) - MAX_STATE_FILES]:
+            try:
+                old_file.unlink()
+            except OSError:
+                pass
+
+# =============================================================================
+# 5. PANEL UI — widgets, callbacks, and layout
+# =============================================================================
+
+
 DEFAULT_PORTFOLIO = [
     {"ticker": "IDFCFIRSTB.NS", "weight": 20.0, "held": 0, "price": 0.0},
     {"ticker": "FIVESTAR.NS", "weight": 15.0, "held": 0, "price": 0.0},
@@ -217,50 +426,12 @@ def _portfolio_with_names(rows: list[dict]) -> list[dict]:
     return [{**r, "name": name_for_ticker(r["ticker"])} for r in rows]
 
 
-# State directory for persisting rebalance runs
-STATE_DIR = Path(__file__).resolve().parent / "state"
-
-
-def load_latest_state() -> tuple[list[dict], float] | None:
-    """
-    Load the most recent rebalance state. Returns (portfolio, amount) or None.
-    Portfolio rows use ticker-derived names (not stored name).
-    """
-    if not STATE_DIR.exists():
-        return None
-    files = sorted(STATE_DIR.glob("rebalance_*.json"), reverse=True)
-    if not files:
-        return None
-    try:
-        with open(files[0], encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-    result = data.get("rebalance_result", [])
-    if not result:
-        return None
-    portfolio = [
-        {
-            "ticker": r["ticker"],
-            "weight": r["weight"],
-            "held": int(r.get("new_held", r.get("held", 0))),
-            "price": float(r.get("price", 0)),
-        }
-        for r in result
-    ]
-    amount = float(data.get("amount", 10_000))
-    return (_portfolio_with_names(portfolio), amount)
-
-
 # ---- Widgets ----
 monthly_input = pn.widgets.FloatInput(
     name="Monthly Investment (₹)", value=10_000, step=1000, start=0, width=220,
 )
-
 ticker_input = pn.widgets.TextInput(
-    name="Add Ticker",
-    placeholder="e.g. TATAMOTORS.NS",
-    width=250,
+    name="Add Ticker", placeholder="e.g. TATAMOTORS.NS", width=250,
 )
 weight_input = pn.widgets.FloatInput(
     name="Weight %", value=10.0, step=1.0, start=0, end=100, width=100,
@@ -269,9 +440,12 @@ held_input = pn.widgets.IntInput(
     name="Shares Held", value=0, step=1, start=0, width=100,
 )
 add_btn = pn.widgets.Button(
-    name="➕ Add to Portfolio", button_type="primary", width=180)
+    name="➕ Add to Portfolio", button_type="primary", width=180,
+)
 
-# Initialize portfolio from state or defaults (before widgets that use it)
+# Initialize portfolio: try loading persisted state, else use defaults.
+# Because load_latest_state now restores _name_cache from the state file,
+# this does NOT make any yFinance API calls if a state file exists.
 portfolio_data: list[dict] = []
 _loaded = load_latest_state()
 if _loaded:
@@ -281,13 +455,11 @@ else:
     portfolio_data = _portfolio_with_names(DEFAULT_PORTFOLIO)
 
 remove_input = pn.widgets.TextInput(
-    name="Remove Ticker",
-    placeholder="e.g. TATAMOTORS.NS",
-    width=250,
+    name="Remove Ticker", placeholder="e.g. TATAMOTORS.NS", width=250,
 )
 remove_btn = pn.widgets.Button(
-    name="🗑️ Remove", button_type="danger", width=120)
-
+    name="🗑️ Remove", button_type="danger", width=120,
+)
 fetch_btn = pn.widgets.Button(
     name="📡 Fetch Live Prices", button_type="success", width=200,
 )
@@ -298,9 +470,9 @@ apply_btn = pn.widgets.Button(
     name="✅ Apply Orders to Holdings", button_type="primary", width=250,
 )
 
-# Status and output panes
 status_pane = pn.pane.Alert(
-    "Ready. Add stocks and fetch prices to begin.", alert_type="info")
+    "Ready. Add stocks and fetch prices to begin.", alert_type="info",
+)
 portfolio_table = pn.widgets.Tabulator(
     pd.DataFrame(portfolio_data),
     layout="fit_data_stretch",
@@ -321,57 +493,12 @@ portfolio_table = pn.widgets.Tabulator(
 )
 
 result_pane = pn.pane.HTML(
-    "<i>No rebalance computed yet.</i>", sizing_mode="stretch_width")
+    "<i>No rebalance computed yet.</i>", sizing_mode="stretch_width",
+)
 
-# Store last computed result globally so "Apply" can use it
+# Global state for tracking the last calculation (so Apply can reference it)
 last_result_df: pd.DataFrame | None = None
-
-
-def save_rebalance_state(amount: float, portfolio: list[dict], result: pd.DataFrame) -> Path:
-    """
-    Persist rebalance data to a dated JSON file in the state directory.
-    Returns the path to the saved file.
-    """
-    STATE_DIR.mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    filepath = STATE_DIR / f"rebalance_{ts}.json"
-
-    def _to_jsonable(v):
-        if hasattr(v, "item"):
-            v = v.item()
-        if isinstance(v, float):
-            return None if v != v else round(v, 4)
-        if isinstance(v, (int,)) and not isinstance(v, bool):
-            return int(v)
-        return v
-
-    result_records = []
-    for _, row in result.iterrows():
-        rec = {k: _to_jsonable(v) for k, v in row.to_dict().items()}
-        result_records.append(rec)
-
-    liquidation_total = float(result["sell_value"].sum())
-
-    data = {
-        "timestamp": datetime.now().isoformat(),
-        "amount": amount,
-        "portfolio_before": portfolio,
-        "rebalance_result": result_records,
-        "summary": {
-            "current_value": float(result["current_value"].sum()),
-            "total_invested": float(result["buy_cost"].sum()),
-            "liquidation_proceeds": liquidation_total,
-            "available_cash": amount + liquidation_total,
-            "leftover": float(
-                (amount + liquidation_total) - result["buy_cost"].sum()
-            ),
-        },
-    }
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, default=str)
-
-    return filepath
+last_saved_path: Path | None = None     # track which file to mark as applied
 
 
 def refresh_portfolio_table():
@@ -379,8 +506,28 @@ def refresh_portfolio_table():
     portfolio_table.value = pd.DataFrame(portfolio_data)
 
 
-def on_add_stock(event):  # pyright: ignore[reportUnusedParameter]
-    """Add a new stock to the portfolio."""
+def sync_edits_from_table():
+    """
+    Read back any manual edits the user made directly in the Tabulator cells.
+    This is called before every operation that reads portfolio_data to ensure
+    inline table edits are never silently lost.
+    """
+    edited = portfolio_table.value
+    if edited is None or edited.empty:
+        return
+    for i, row in edited.iterrows():
+        if i < len(portfolio_data):
+            portfolio_data[i]["weight"] = float(
+                row.get("weight", portfolio_data[i]["weight"]))
+            portfolio_data[i]["held"] = int(
+                row.get("held", portfolio_data[i]["held"]))
+            portfolio_data[i]["price"] = float(
+                row.get("price", portfolio_data[i]["price"]))
+
+
+# ---- Callbacks ----
+
+def on_add_stock(event):
     sync_edits_from_table()
     ticker = ticker_input.value.strip().upper()
     if not ticker:
@@ -395,11 +542,8 @@ def on_add_stock(event):  # pyright: ignore[reportUnusedParameter]
         return
     name = name_for_ticker(ticker)
     portfolio_data.append({
-        "ticker": ticker,
-        "name": name,
-        "weight": weight_input.value,
-        "held": held_input.value,
-        "price": 0.0,
+        "ticker": ticker, "name": name,
+        "weight": weight_input.value, "held": held_input.value, "price": 0.0,
     })
     refresh_portfolio_table()
     ticker_input.value = ""
@@ -408,8 +552,7 @@ def on_add_stock(event):  # pyright: ignore[reportUnusedParameter]
     status_pane.alert_type = "success"
 
 
-def on_remove_stock(event):  # pyright: ignore[reportUnusedParameter]
-    """Remove a stock from the portfolio."""
+def on_remove_stock(event):
     sync_edits_from_table()
     ticker = remove_input.value.strip().upper()
     before = len(portfolio_data)
@@ -424,8 +567,7 @@ def on_remove_stock(event):  # pyright: ignore[reportUnusedParameter]
         status_pane.alert_type = "warning"
 
 
-def on_fetch_prices(event):  # pyright: ignore[reportUnusedParameter]
-    """Fetch live prices for all tickers via yFinance."""
+def on_fetch_prices(event):
     sync_edits_from_table()
     status_pane.object = "📡 Fetching prices... this may take a few seconds."
     status_pane.alert_type = "info"
@@ -457,30 +599,14 @@ def on_fetch_prices(event):  # pyright: ignore[reportUnusedParameter]
         status_pane.alert_type = "success"
 
 
-def sync_edits_from_table():
-    """Read back any manual edits the user made in the table."""
-    edited = portfolio_table.value
-    if edited is None or edited.empty:
-        return
-    for i, row in edited.iterrows():
-        if i < len(portfolio_data):
-            portfolio_data[i]["weight"] = float(
-                row.get("weight", portfolio_data[i]["weight"]))
-            portfolio_data[i]["held"] = int(
-                row.get("held", portfolio_data[i]["held"]))
-            portfolio_data[i]["price"] = float(
-                row.get("price", portfolio_data[i]["price"]))
-
-
-def on_calculate(event):  # pyright: ignore[reportUnusedParameter]
-    """Run the rebalancing algorithm and display results."""
-    global last_result_df
+def on_calculate(event):
+    global last_result_df, last_saved_path
 
     sync_edits_from_table()
 
     # ── Validation ──
-    # Weights of ACTIVE stocks (weight > 0) must sum to 100%.
-    # Stocks with weight=0 are liquidation candidates and excluded from this check.
+    # Only active stocks (weight > 0) must sum to 100%.
+    # Stocks at 0% are either liquidation candidates or inert.
     active_weights = [d["weight"] for d in portfolio_data if d["weight"] > 0]
     total_active_w = sum(active_weights)
     if abs(total_active_w - 100) > 0.1:
@@ -491,11 +617,17 @@ def on_calculate(event):  # pyright: ignore[reportUnusedParameter]
         status_pane.alert_type = "danger"
         return
 
-    # All stocks need a price (even liquidation ones — we need it to compute proceeds)
-    missing = [d["ticker"] for d in portfolio_data if d["price"] <= 0]
-    if missing:
+    # Price is required for any stock that is either active (weight>0)
+    # or a liquidation candidate (weight=0 but held>0, because we need
+    # the price to compute sale proceeds). Stocks with weight=0 and
+    # held=0 are inert and don't need a price.
+    needs_price = [
+        d["ticker"] for d in portfolio_data
+        if d["price"] <= 0 and (d["weight"] > 0 or d["held"] > 0)
+    ]
+    if needs_price:
         status_pane.object = (
-            f"⚠️ Missing prices for: {', '.join(missing)}. "
+            f"⚠️ Missing prices for: {', '.join(needs_price)}. "
             "Fetch or enter manually."
         )
         status_pane.alert_type = "danger"
@@ -506,12 +638,14 @@ def on_calculate(event):  # pyright: ignore[reportUnusedParameter]
     result = calculate_rebalance(df, monthly_input.value)
     last_result_df = result
 
-    # ── Persist state ──
+    # ── Save state (applied=False — not yet confirmed by user) ──
     saved_path = save_rebalance_state(
         amount=monthly_input.value,
         portfolio=[{**d} for d in portfolio_data],
         result=result,
+        applied=False,
     )
+    last_saved_path = saved_path
 
     # ── Build HTML results ──
     total_invested = result["buy_cost"].sum()
@@ -520,12 +654,10 @@ def on_calculate(event):  # pyright: ignore[reportUnusedParameter]
     available_cash = monthly_input.value + liquidation_val
     leftover = available_cash - total_invested
 
-    # Count how many sell vs buy orders for the status message
     n_sells = int((result["sell_qty"] > 0).sum())
     n_buys = int((result["buy_qty"] > 0).sum())
 
     # ── Summary cards ──
-    # Build the liquidation card conditionally — only shown when there are sells
     liquidation_card = ""
     if liquidation_val > 0:
         liquidation_card = f"""
@@ -567,61 +699,38 @@ def on_calculate(event):  # pyright: ignore[reportUnusedParameter]
     """
 
     # ── Orders table ──
-    # Each row shows one of three states:
-    #   🔴 SELL  — liquidation (weight=0, held>0)
-    #   🟢 BUY   — active stock getting new shares
-    #   —        — active stock already at/above target, no action needed
     rows_html = ""
     for _, r in result.iterrows():
         is_sell = int(r["sell_qty"]) > 0
         is_buy = int(r["buy_qty"]) > 0
 
-        # Row background: red tint for sells, green tint for buys
         row_bg = ""
         if is_sell:
             row_bg = "background:#2a1015;"
         elif is_buy:
             row_bg = "background:#0d1a0d;"
 
-        # Action cell: the primary instruction for the user
         if is_sell:
             action = (
                 f'<span style="color:#f87171; font-weight:700;">'
                 f'🔴 SELL {int(r["sell_qty"])}</span>'
             )
+            cashflow = f'<span style="color:#f87171;">+₹{r["sell_value"]:,.0f}</span>'
         elif is_buy:
             action = (
                 f'<span style="color:#34d399; font-weight:700;">'
                 f'🟢 BUY {int(r["buy_qty"])}</span>'
             )
+            cashflow = f'<span style="color:#60a5fa;">−₹{r["buy_cost"]:,.0f}</span>'
         else:
             action = '<span style="color:#666;">—</span>'
-
-        # Cash flow: positive for sells (money coming in), negative for buys
-        if is_sell:
-            cashflow = (
-                f'<span style="color:#f87171;">+₹{r["sell_value"]:,.0f}</span>'
-            )
-        elif is_buy:
-            cashflow = (
-                f'<span style="color:#60a5fa;">−₹{r["buy_cost"]:,.0f}</span>'
-            )
-        else:
             cashflow = '<span style="color:#666;">—</span>'
 
-        # Drift colour: red if underweight, green if overweight, grey if close
         drift_val = r["drift"]
-        if drift_val < -1:
-            drift_color = "#f87171"
-        elif drift_val > 1:
-            drift_color = "#34d399"
-        else:
-            drift_color = "#888"
-
-        # New weight colour: green if close to target, yellow if drifting
-        nw_color = (
-            "#34d399" if abs(r["new_weight"] - r["weight"]) < 2 else "#fbbf24"
-        )
+        drift_color = "#f87171" if drift_val < - \
+            1 else "#34d399" if drift_val > 1 else "#888"
+        nw_color = "#34d399" if abs(
+            r["new_weight"] - r["weight"]) < 2 else "#fbbf24"
 
         rows_html += f"""
         <tr style="{row_bg}">
@@ -661,7 +770,6 @@ def on_calculate(event):  # pyright: ignore[reportUnusedParameter]
 
     result_pane.object = summary_html + table_html
 
-    # Build a descriptive status message
     parts = []
     if n_sells > 0:
         parts.append(f"{n_sells} sell{'s' if n_sells != 1 else ''}")
@@ -676,24 +784,49 @@ def on_calculate(event):  # pyright: ignore[reportUnusedParameter]
     status_pane.alert_type = "success"
 
 
-def on_apply(event):  # pyright: ignore[reportUnusedParameter]
-    """Update held quantities in portfolio_data based on last computed result."""
-    global last_result_df
+def on_apply(event):
+    """
+    Apply the calculated rebalance orders to the portfolio. This:
+      1. Updates held quantities to post-rebalance values
+      2. Removes liquidated stocks (weight=0) from the portfolio entirely
+      3. Marks the state file as applied (so it loads correctly next startup)
+    """
+    global last_result_df, last_saved_path
+
     if last_result_df is None:
         status_pane.object = "⚠️ No rebalance to apply. Calculate first."
         status_pane.alert_type = "warning"
         return
 
+    # Step 1: Update holdings from rebalance result
     for _, r in last_result_df.iterrows():
         for d in portfolio_data:
             if d["ticker"] == r["ticker"]:
                 d["held"] = int(r["new_held"])
+
+    # Step 2: Remove liquidated stocks (weight=0, now held=0 after selling)
+    # These are fully exited positions — keeping them would just clutter the table.
+    liquidated = [d["ticker"]
+                  for d in portfolio_data if d["weight"] == 0 and d["held"] == 0]
+    portfolio_data[:] = [d for d in portfolio_data if not (
+        d["weight"] == 0 and d["held"] == 0)]
+
+    # Step 3: Mark the state file as applied so it loads correctly on restart
+    if last_saved_path and last_saved_path.exists():
+        mark_state_applied(last_saved_path)
+
     refresh_portfolio_table()
     last_result_df = None
+    last_saved_path = None
+
+    liquidated_msg = ""
+    if liquidated:
+        liquidated_msg = f" Removed liquidated: {', '.join(liquidated)}."
+
     result_pane.object = (
         "<i>Orders applied. Holdings updated. Ready for next month!</i>"
     )
-    status_pane.object = "✅ Holdings updated successfully."
+    status_pane.object = f"✅ Holdings updated successfully.{liquidated_msg}"
     status_pane.alert_type = "success"
 
 
@@ -705,7 +838,7 @@ calc_btn.on_click(on_calculate)
 apply_btn.on_click(on_apply)
 
 # =============================================================================
-# 5. LAYOUT
+# 6. LAYOUT
 # =============================================================================
 header = pn.pane.Markdown(
     "# 📊 Portfolio Rebalancer\n"
@@ -727,10 +860,12 @@ explanation = pn.pane.Markdown("""
 5. **Liquidate** — set any stock's weight to **0%** to mark it for a full sell. The proceeds
    get redeployed into your remaining active positions automatically.
 6. **Apply** — after executing trades in your broker, click Apply to update holdings.
+   Liquidated positions are automatically removed from the portfolio.
 7. **Repeat** next month!
 
 *Prices are fetched from Yahoo Finance (NSE). The `.NS` suffix is auto-added. You can
-also type `.BO` for BSE. Edit any cell in the table directly.*
+also type `.BO` for BSE. Edit any cell in the table directly. Portfolio state is saved
+to disk automatically and restored on restart.*
 """)
 
 layout = pn.Column(
@@ -749,7 +884,6 @@ layout = pn.Column(
     styles={"margin": "0 auto", "padding": "20px"},
 )
 
-# Serve the app
 layout.servable(title="Portfolio Rebalancer")
 
 if __name__ == "__main__":
