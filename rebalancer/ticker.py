@@ -12,7 +12,12 @@ Two responsibilities:
    sequential per-ticker requests.
 """
 
+from   functools                import cache
+
+import pandas as pd
 import yfinance as yf
+
+from   rebalancer.config        import DATA_DIR
 
 # ── In-memory name cache ──
 # This is a module-level dict that acts as the single source of truth for
@@ -23,6 +28,12 @@ import yfinance as yf
 #   3. Manual insertion via populate_name_cache()
 _name_cache: dict[str, str] = {}
 
+@cache
+def get_nifty_tickers():
+    """Get dataframe for nifty data"""
+    file_path = DATA_DIR / "nifty_metadata.csv"
+    df = pd.read_csv(file_path)
+    return df.set_index("NAME OF COMPANY")["SYMBOL"].to_dict()
 
 def name_for_ticker(ticker: str) -> str:
     """

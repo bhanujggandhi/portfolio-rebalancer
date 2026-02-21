@@ -13,6 +13,9 @@ from   pathlib                  import Path
 # `panel serve app.py` and `python app.py` both find the same directory.
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
 # Maximum number of state files to retain per portfolio. Older files
 # are automatically deleted when this limit is exceeded.
 MAX_STATE_FILES = 50

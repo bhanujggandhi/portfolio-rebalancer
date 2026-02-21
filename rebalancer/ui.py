@@ -8,15 +8,16 @@ callbacks, and the final layout object.
 Imported by app.py, which simply calls layout.servable().
 """
 
-from datetime import datetime
+from   datetime                 import datetime
 
 import pandas as pd
 import panel as pn
 
-from . import state
-from .config import APP_TITLE, DEFAULT_STOCKS
-from .engine import calculate_rebalance
-from .ticker import fetch_all_prices, name_for_ticker
+from   .                        import state
+from   .config                  import APP_TITLE, DEFAULT_STOCKS
+from   .engine                  import calculate_rebalance
+from   .ticker                  import (fetch_all_prices, get_nifty_tickers,
+                                        name_for_ticker)
 
 
 # =============================================================================
@@ -28,11 +29,11 @@ _active_slug = _registry[0]["slug"]
 _init_state = state.load_latest_applied(_active_slug)
 
 portfolio_data: list[dict] = []
-_init_amount = 10_0000.0
+INIT_AMOUNT = 10_0000.0
 
 if _init_state:
     portfolio_data = _init_state[0]
-    _init_amount = _init_state[1]
+    INIT_AMOUNT = _init_state[1]
 else:
     portfolio_data = state.ensure_portfolio_fields(DEFAULT_STOCKS)
 
@@ -80,11 +81,14 @@ load_state_btn = pn.widgets.Button(
 
 # ── Stock management ──
 monthly_input = pn.widgets.FloatInput(
-    name="Monthly Investment (₹)", value=_init_amount, step=1000, start=0, width=220,
+    name="Monthly Investment (₹)", value=INIT_AMOUNT, step=1000, start=0, width=220,
 )
-ticker_input = pn.widgets.TextInput(
-    name="Add Ticker", placeholder="e.g. TATAMOTORS.NS", width=250,
+ticker_input = pn.widgets.AutocompleteInput(
+    name="Add Ticker", placeholder="e.g. TATAMOTORS.NS",
+    case_sensitive=False, search_strategy='includes',
+    options=get_nifty_tickers(), restrict=False, width=250,
 )
+
 weight_input = pn.widgets.FloatInput(
     name="Weight %", value=10.0, step=1.0, start=0, end=100, width=100,
 )
@@ -93,16 +97,21 @@ held_input = pn.widgets.IntInput(
 )
 add_btn = pn.widgets.Button(
     name="➕ Add Stock", button_type="primary", width=140)
-remove_input = pn.widgets.TextInput(
-    name="Remove Ticker", placeholder="e.g. TATAMOTORS.NS", width=250,
+remove_input = pn.widgets.AutocompleteInput(
+    name="Remove Ticker", placeholder="e.g. TATAMOTORS.NS", 
+    options=[d['ticker'] for d in portfolio_data],
+    case_sensitive=False, search_strategy='includes',
+    width=250,
 )
 remove_btn = pn.widgets.Button(
     name="🗑️ Remove", button_type="danger", width=120)
 
 # ── Trade restrictions ──
-restrict_input = pn.widgets.TextInput(
+restrict_input = pn.widgets.AutocompleteInput(
     name="Restrict / Unrestrict Ticker",
     placeholder="e.g. RELIANCE.NS (toggles restriction)",
+    options=[d['ticker'] for d in portfolio_data],
+    case_sensitive=False, search_strategy='includes',
     width=300,
 )
 restrict_btn = pn.widgets.Button(

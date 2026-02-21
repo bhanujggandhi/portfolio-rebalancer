@@ -22,15 +22,15 @@ Key design decisions:
    doesn't require yFinance API calls just to display company names.
 """
 
-from datetime import datetime
+from   datetime                 import datetime
 import json
-from pathlib import Path
+from   pathlib                  import Path
 import re
 import shutil
 
-from .config import (DEFAULT_PORTFOLIO_NAME,
-                     MAX_STATE_FILES, STATE_DIR)
-from .ticker import get_name_cache, populate_name_cache
+from   .config                  import (DEFAULT_PORTFOLIO_NAME,
+                                        MAX_STATE_FILES, STATE_DIR)
+from   .ticker                  import get_name_cache, populate_name_cache
 
 
 # =============================================================================
