@@ -65,7 +65,7 @@ def _build_state_options(slug: str) -> dict[str, str]:
     entries = state.list_state_files(slug)
     if not entries:
         return {"(No saved states)": ""}
-    opts = {"— Select a state to load —": ""}
+    opts = {}
     for e in entries:
         opts[e["label"]] = e["filename"]
     return opts
@@ -84,7 +84,7 @@ monthly_input = pn.widgets.FloatInput(
     name="Monthly Investment (₹)", value=INIT_AMOUNT, step=1000, start=0, width=220,
 )
 ticker_input = pn.widgets.AutocompleteInput(
-    name="Add Ticker", placeholder="e.g. TATAMOTORS.NS",
+    name="Add Company", placeholder="e.g. Tata Motors",
     case_sensitive=False, search_strategy='includes',
     options=get_nifty_tickers(), restrict=False, width=250,
 )
@@ -98,10 +98,9 @@ held_input = pn.widgets.IntInput(
 add_btn = pn.widgets.Button(
     name="➕ Add Stock", button_type="primary", width=140)
 remove_input = pn.widgets.AutocompleteInput(
-    name="Remove Ticker", placeholder="e.g. TATAMOTORS.NS", 
-    options=[d['ticker'] for d in portfolio_data],
+    name="Remove Company", placeholder="e.g. Tata Motors",
     case_sensitive=False, search_strategy='includes',
-    width=250,
+    options=get_nifty_tickers(), restrict=False, width=250,
 )
 remove_btn = pn.widgets.Button(
     name="🗑️ Remove", button_type="danger", width=120)
@@ -109,10 +108,9 @@ remove_btn = pn.widgets.Button(
 # ── Trade restrictions ──
 restrict_input = pn.widgets.AutocompleteInput(
     name="Restrict / Unrestrict Ticker",
-    placeholder="e.g. RELIANCE.NS (toggles restriction)",
-    options=[d['ticker'] for d in portfolio_data],
+    placeholder="e.g. Tata Motors (toggles restriction)",
     case_sensitive=False, search_strategy='includes',
-    width=300,
+    options=get_nifty_tickers(), restrict=False, width=300,
 )
 restrict_btn = pn.widgets.Button(
     name="🔒 Toggle Restriction", button_type="warning", width=200,

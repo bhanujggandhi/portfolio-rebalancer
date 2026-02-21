@@ -51,7 +51,7 @@ def name_for_ticker(ticker: str) -> str:
         return _name_cache[ticker]
     try:
         info = yf.Ticker(ticker).info or {}
-        name = info.get("shortName") or info.get("longName")
+        name = info.get("longName") or info.get("shortName")
         if name:
             _name_cache[ticker] = name
             return name

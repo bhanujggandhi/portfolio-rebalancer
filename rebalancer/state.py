@@ -28,9 +28,11 @@ from   pathlib                  import Path
 import re
 import shutil
 
+
 from   .config                  import (DEFAULT_PORTFOLIO_NAME,
                                         MAX_STATE_FILES, STATE_DIR)
-from   .ticker                  import get_name_cache, populate_name_cache
+from   .ticker                  import (get_name_cache, name_for_ticker,
+                                        populate_name_cache)
 
 
 # =============================================================================
@@ -74,9 +76,8 @@ def ensure_portfolio_fields(rows: list[dict]) -> list[dict]:
         row.setdefault("held", 0)
         row.setdefault("weight", 0.0)
         row["name"] = (
-            cache.get(row["ticker"])
-            or row.get("name")
-            or row["ticker"].replace(".NS", "").replace(".BO", "")
+            row.get("name", cache.get(row['ticker'], 
+            name_for_ticker(row['ticker'])))
         )
         out.append(row)
     return out
@@ -295,11 +296,16 @@ def load_state_from_file(filepath: Path) -> tuple[list[dict], float] | None:
     return (ensure_portfolio_fields(portfolio), amount)
 
 
-def load_latest_applied(slug: str) -> tuple[list[dict], float] | None:
+def load_latest_applied(slug: str, applied_only=False) -> tuple[list[dict], float] | None:
     """Load the most recent applied state for a portfolio."""
-    for entry in list_state_files(slug):
-        if entry["applied"]:
-            return load_state_from_file(entry["path"])
+    if applied_only:
+        for entry in list_state_files(slug):
+            if entry["applied"]:
+                return load_state_from_file(entry["path"])
+        return None
+    state_files = list_state_files(slug)
+    if state_files:
+        return load_state_from_file(state_files[0]['path'])
     return None
 
 
